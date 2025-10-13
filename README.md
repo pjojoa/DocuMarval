@@ -91,3 +91,4 @@ pip install -r requirements.txt
 - Si el entorno virtual fue movido de carpeta, se recomienda eliminarlo y crearlo nuevamente.
 - Todas las dependencias necesarias están en el archivo `requirements.txt`.
 - En de que Tesseract falle o presente resultados insatisfactorios se utiliza Gemini AI como respaldo, por lo que se recomienda que el PDF y las facturas en el tengan la mejor calidad posible.
+- La solución actualmente lee a detalle cada factura entregada en el PDF, por ello, el tiempo de ejecución es directamente proporcional a la cantidad de facturas adjuntas en el PDF.
