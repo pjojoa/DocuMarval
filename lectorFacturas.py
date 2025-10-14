@@ -9,6 +9,8 @@ from io import BytesIO
 import os
 import platform
 import subprocess
+from dotenv import load_dotenv
+load_dotenv()
 
 # ==================== DETECCIÓN AUTOMÁTICA DE DEPENDENCIAS ====================
 
@@ -30,7 +32,7 @@ def detectar_tesseract():
                 if os.path.exists(ruta):
                     pytesseract.pytesseract.tesseract_cmd = ruta
                     break
-                elif st.secrets.get("TESSERACT_PATH", None):
+                elif os.getenv('TESSERACT_PATH') or st.secrets.get("TESSERACT_PATH", None):
                     ruta_secrets = st.secrets["TESSERACT_PATH"]
                     if os.path.exists(ruta_secrets):
                         pytesseract.pytesseract.tesseract_cmd = ruta_secrets
@@ -55,7 +57,7 @@ def detectar_poppler():
     """Detecta si Poppler está disponible"""
     try:
         # Intentar obtener ruta de Poppler desde secrets
-        poppler_path = st.secrets.get("POPPLER_PATH", None)
+        poppler_path = os.getenv('POPPLER_PATH') or st.secrets.get("POPPLER_PATH", None)
         
         # Si no hay ruta en secrets y estamos en Windows, buscar en rutas comunes
         if not poppler_path and platform.system() == 'Windows':
@@ -88,7 +90,7 @@ OPENCV_DISPONIBLE, cv2, np = detectar_opencv()
 POPPLER_DISPONIBLE, POPPLER_PATH = detectar_poppler()
 
 # ==================== CONFIGURACIÓN ====================
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or st.secrets.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -243,7 +245,7 @@ def parsear_factura_tesseract(texto):
 def extraer_con_gemini(imagen):
     """Extrae datos usando Gemini Vision"""
     try:
-        model = genai.GenerativeModel(st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash"))
+        model = genai.GenerativeModel(os.getenv('GEMINI_MODEL') or st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash"))
         
         # Convertir imagen a bytes
         img_byte_arr = BytesIO()
