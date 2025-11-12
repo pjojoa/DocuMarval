@@ -3,8 +3,7 @@ services:
     name: documarval
     env: python
     plan: starter
-    pythonVersion: "3.12"
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
     startCommand: streamlit run lectorFacturas.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
     envVars:
       - key: GEMINI_API_KEY
@@ -15,4 +14,3 @@ services:
         value: /usr/bin
     healthCheckPath: /
     autoDeploy: true
-
