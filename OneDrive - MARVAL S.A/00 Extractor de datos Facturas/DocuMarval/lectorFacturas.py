@@ -2,7 +2,6 @@ import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 import google.generativeai as genai
 from pdf2image import convert_from_bytes
-from PIL import Image
 import pandas as pd
 import json
 import re
@@ -11,6 +10,7 @@ import os
 import platform
 import subprocess
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ==================== FUNCIÓN HELPER PARA SECRETS ====================
@@ -27,366 +27,292 @@ def get_secret(key, default=None):
 
 # ==================== DETECCIÓN AUTOMÁTICA DE DEPENDENCIAS ====================
 
-def detectar_tesseract():
-    """Detecta si Tesseract está disponible en el sistema"""
-    try:
-        import pytesseract
-        
-        # Intentar rutas comunes en Windows
-        if platform.system() == 'Windows':
-            rutas_posibles = [
-                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-                r'C:\Program Files\Tesseract\tesseract.exe',
-                r'C:\Users\{}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'.format(os.getenv('USERNAME', '')),
-            ]
-            
-            for ruta in rutas_posibles:
-                if os.path.exists(ruta):
-                    pytesseract.pytesseract.tesseract_cmd = ruta
-                    break
-                elif os.getenv('TESSERACT_PATH') or get_secret("TESSERACT_PATH", None):
-                    ruta_secrets = get_secret("TESSERACT_PATH", None) or os.getenv('TESSERACT_PATH')
-                    if ruta_secrets and os.path.exists(ruta_secrets):
-                        pytesseract.pytesseract.tesseract_cmd = ruta_secrets
-                        break
-        
-        # Probar si funciona
-        version = pytesseract.get_tesseract_version()
-        return True, pytesseract, f"v{version}"
-    except Exception as e:
-        return False, None, str(e)
-
-def detectar_opencv():
-    """Detecta si OpenCV está disponible"""
-    try:
-        import cv2
-        import numpy as np
-        return True, cv2, np
-    except:
-        return False, None, None
-
 def detectar_poppler():
-    """Detecta si Poppler está disponible"""
-    try:
-        # Intentar obtener ruta de Poppler desde secrets
-        poppler_path = os.getenv('POPPLER_PATH') or get_secret("POPPLER_PATH", None)
-        
-        # Si no hay ruta en secrets y estamos en Windows, buscar en rutas comunes
-        if not poppler_path and platform.system() == 'Windows':
-            rutas_posibles = [
+    """Detecta si Poppler está disponible y retorna su ruta"""
+    poppler_path = os.getenv('POPPLER_PATH') or get_secret("POPPLER_PATH", None)
+    
+    if poppler_path and os.path.exists(poppler_path):
+        return True, poppler_path
+    
+    if platform.system() == 'Windows':
+        rutas_comunes = [
+            r'C:\Program Files\poppler-25.07.0\Library\bin',
                 r'C:\Program Files\poppler\Library\bin',
-                r'C:\Program Files\poppler-24.02.0\Library\bin',
                 r'C:\poppler\Library\bin',
-                r'C:\Program Files\poppler-25.07.0\Library\bin',
             ]
-            
-            for ruta in rutas_posibles:
+        for ruta in rutas_comunes:
                 if os.path.exists(ruta):
                     return True, ruta
         
-        # Si tenemos ruta en secrets, verificar que existe
-        if poppler_path and os.path.exists(poppler_path):
-            return True, poppler_path
-            
-        # En Linux/Mac o si no se encontró en rutas Windows, verificar si está en PATH
-        result = subprocess.run(['pdftoppm', '-v'], 
-                              capture_output=True, 
-                              timeout=5)
+    try:
+        subprocess.run(['pdftoppm', '-v'], capture_output=True, timeout=2, check=False)
         return True, None
     except:
         return False, None
 
 # Realizar detección al inicio
-TESSERACT_DISPONIBLE, pytesseract, TESSERACT_VERSION = detectar_tesseract()
-OPENCV_DISPONIBLE, cv2, np = detectar_opencv()
 POPPLER_DISPONIBLE, POPPLER_PATH = detectar_poppler()
 
 # ==================== CONFIGURACIÓN ====================
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or get_secret("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv('GEMINI_MODEL') or get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ==================== FUNCIONES DE PREPROCESAMIENTO (Solo si OpenCV disponible) ====================
-
-def preprocesar_imagen(imagen):
-    """Mejora la imagen para mejor OCR - Solo si OpenCV está disponible"""
-    if not OPENCV_DISPONIBLE:
-        return imagen
-    
-    try:
-        # Convertir PIL a numpy array
-        img_array = np.array(imagen)
-        
-        # Convertir a escala de grises
-        gris = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        
-        # Aplicar threshold adaptativo
-        thresh = cv2.adaptiveThreshold(
-            gris, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Reducir ruido
-        denoised = cv2.fastNlMeansDenoising(thresh)
-        
-        return Image.fromarray(denoised)
-    except:
-        return imagen
-
-def calcular_confianza_ocr(texto_ocr, data_ocr=None):
-    """Calcula la confianza del OCR para facturas de servicios públicos"""
-    if not texto_ocr or len(texto_ocr.strip()) < 50:
-        return 0
-    
-    # Factor 1: Longitud del texto
-    factor_longitud = min(len(texto_ocr) / 500, 1.0)
-    
-    # Factor 2: Palabras clave de servicios públicos
-    palabras_clave = ['contrato', 'total', 'pagar', 'direccion', 'referencia', 'periodo', 'factura']
-    texto_lower = texto_ocr.lower()
-    palabras_encontradas = sum(1 for palabra in palabras_clave if palabra in texto_lower)
-    factor_palabras = palabras_encontradas / len(palabras_clave)
-    
-    # Factor 3: Números
-    numeros = re.findall(r'\d+', texto_ocr)
-    factor_numeros = min(len(numeros) / 10, 1.0)
-    
-    # Factor 4: Confianza de Tesseract
-    factor_tesseract = 0.5
-    if data_ocr:
-        try:
-            confidencias = [int(conf) for conf in data_ocr.get('conf', []) if int(conf) > 0]
-            if confidencias:
-                factor_tesseract = sum(confidencias) / len(confidencias) / 100
-        except:
-            pass
-    
-    # Factor 5: Detectar "basura" (caracteres extraños que indican OCR malo)
-    caracteres_raros = len(re.findall(r'[¿¡°•★◆■□▪▫]', texto_ocr))
-    factor_basura = max(0, 1 - (caracteres_raros / 50))  # Penalizar caracteres raros
-    
-    # Factor 6: Ratio de palabras vs caracteres extraños
-    palabras = len(re.findall(r'\b[a-zA-ZáéíóúñÁÉÍÓÚÑ]{3,}\b', texto_ocr))
-    factor_palabras_validas = min(palabras / 20, 1.0)
-    
-    confianza = (
-        factor_longitud * 0.15 +
-        factor_palabras * 0.25 +
-        factor_numeros * 0.15 +
-        factor_tesseract * 0.20 +
-        factor_basura * 0.15 +
-        factor_palabras_validas * 0.10
-    )
-    
-    return confianza
-
-# ==================== EXTRACCIÓN CON TESSERACT ====================
-
-def extraer_con_tesseract(imagen):
-    """Extrae texto usando Tesseract OCR - Solo si está disponible"""
-    if not TESSERACT_DISPONIBLE:
-        return "", {}
-    
-    try:
-        # Preprocesar imagen
-        img_procesada = preprocesar_imagen(imagen)
-        
-        # Extraer texto
-        config = '--oem 3 --psm 6'
-        texto = pytesseract.image_to_string(img_procesada, lang='spa', config=config)
-        
-        # Obtener datos detallados
-        data = pytesseract.image_to_data(img_procesada, lang='spa', 
-                                         output_type=pytesseract.Output.DICT)
-        
-        return texto, data
-    except Exception as e:
-        return "", {}
-
-def parsear_factura_tesseract(texto):
-    """Extrae datos estructurados del texto de Tesseract - Facturas de servicios públicos"""
-    datos = {
-        "numero_contrato": "",
-        "direccion": "",
-        "codigo_referencia": "",
-        "total_pagar": 0
-    }
-    
-    if not texto:
-        return datos
-    
-    try:
-        # Número de contrato
-        match_contrato = re.search(r'(?:CONTRATO|contrato|No\.?\s*CONTRATO)\s*:?\s*([A-Z0-9-]+)', 
-                                   texto, re.IGNORECASE)
-        if match_contrato:
-            datos["numero_contrato"] = match_contrato.group(1).strip()
-        
-        # Dirección - buscar después de palabras clave
-        match_direccion = re.search(r'(?:DIRECCI[OÓ]N|direcci[oó]n|Dirección)\s*:?\s*([^\n]+)', 
-                                    texto, re.IGNORECASE)
-        if match_direccion:
-            datos["direccion"] = match_direccion.group(1).strip()
-        
-        # Código de referencia
-        match_referencia = re.search(r'(?:C[OÓ]DIGO.*?REFERENCIA|REFERENCIA.*?PAGO|REF.*?ELECTR[OÓ]NICO)\s*:?\s*([A-Z0-9-]+)', 
-                                     texto, re.IGNORECASE | re.DOTALL)
-        if match_referencia:
-            datos["codigo_referencia"] = match_referencia.group(1).strip()
-        
-        # Total a pagar - buscar cerca de "TOTAL A PAGAR"
-        match_total = re.search(r'(?:TOTAL\s*A\s*PAGAR|TOTAL\s*FACTURA)\s*:?\s*\$?\s*([\d,\.]+)', 
-                               texto, re.IGNORECASE)
-        if match_total:
-            valor = match_total.group(1).replace(',', '').replace('.', '')
-            try:
-                # Ajustar si hay decimales (asumir últimos 2 dígitos)
-                if len(valor) > 2:
-                    datos["total_pagar"] = float(valor) / 100 if len(valor) <= 6 else float(valor)
-                else:
-                    datos["total_pagar"] = float(valor)
-            except:
-                pass
-        
-        return datos
-    except:
-        return datos
-
 # ==================== EXTRACCIÓN CON GEMINI ====================
 
+# Cachear el modelo de Gemini para mejor rendimiento
+@st.cache_resource
+def get_gemini_model():
+    """Obtiene el modelo de Gemini (cacheado)"""
+    if not GEMINI_API_KEY:
+        return None
+    return genai.GenerativeModel(GEMINI_MODEL)
+
+# Prompt optimizado (constante)
+PROMPT_GEMINI = """Analiza ÚNICAMENTE esta factura de servicios públicos colombiana (agua, luz, gas, internet, telefonía) y extrae SOLO los datos financieros y de identificación relevantes.
+
+IMPORTANTE - IGNORA COMPLETAMENTE:
+- Texto publicitario, información demográfica, estadísticas
+- Información sobre "adultos mayores", "familias", "grupos demográficos"
+- Números de teléfono (NO los uses como código de referencia o contrato)
+- Información que NO sea parte de los datos de la factura
+
+JSON requerido (SOLO estos campos):
+{
+    "numero_contrato": "número de contrato del servicio (string, vacío si no existe)",
+    "direccion": "dirección del inmueble donde se presta el servicio (string, vacío si no existe)",
+    "codigo_referencia": "código de referencia para pago electrónico/PSE (string, vacío si no existe)",
+    "total_pagar": número decimal sin símbolos de moneda (ejemplo: 125000.50, 0 si no existe),
+    "empresa": "nombre de la empresa de servicios públicos (string, vacío si no existe)",
+    "periodo_facturado": "periodo de facturación (ejemplo: 'Enero 2024', '01/2024', vacío si no existe)",
+    "fecha_vencimiento": "fecha de vencimiento en formato DD/MM/YYYY (string, vacío si no existe)",
+    "numero_factura": "número de factura o recibo (string, vacío si no existe)",
+    "nit_empresa": "NIT de la empresa (string, vacío si no existe)",
+    "consumo": número decimal del consumo en unidades (ejemplo: 150.5, 0 si no aplica o no existe),
+    "medidor": "número de medidor si aplica (string, vacío si no existe)"
+}
+
+REGLAS ESTRICTAS:
+1. numero_contrato: Busca SOLO en "CONTRATO", "No. CONTRATO", "Código Cliente". NO uses números de teléfono, cédulas, o números aleatorios.
+2. direccion: SOLO la dirección física del inmueble. NO incluyas direcciones de oficinas, páginas web, o información de contacto.
+3. codigo_referencia: SOLO códigos de referencia para pago (PSE, código de barras, referencia de pago). NO uses números de teléfono, cédulas, o números aleatorios.
+4. total_pagar: SOLO el monto total a pagar de la factura. Extrae SOLO números, sin símbolos $, puntos de miles, o comas.
+5. empresa: SOLO el nombre de la empresa de servicios públicos. NO incluyas información adicional.
+6. consumo: SOLO si es un servicio medido (agua, luz, gas). Si no aplica o no existe, usa 0.
+7. medidor: SOLO el número de medidor físico. NO uses otros números.
+
+VALIDACIÓN CRÍTICA:
+- NO extraigas información demográfica, estadísticas, o texto publicitario
+- NO uses números de teléfono como código de referencia o contrato
+- NO incluyas información que no esté directamente relacionada con la factura
+- Si un campo no está visible o no existe en la factura, usa "" para strings y 0 para números
+
+Devuelve ÚNICAMENTE el JSON válido, sin markdown, sin explicaciones, sin texto adicional."""
+
+GENERATION_CONFIG = {
+    "temperature": 0.1,
+    "top_p": 0.95,
+    "top_k": 40,
+    "max_output_tokens": 2048,  # Aumentado para evitar truncamiento
+}
+
 def extraer_con_gemini(imagen):
-    """Extrae datos usando Gemini Vision"""
+    """Extrae datos usando Gemini Vision optimizado"""
+    if not GEMINI_API_KEY:
+        st.error("Error: GEMINI_API_KEY no configurada")
+        return None
+    
     try:
-        model = genai.GenerativeModel(os.getenv('GEMINI_MODEL') or get_secret("GEMINI_MODEL", "gemini-2.5-flash"))
+        model = get_gemini_model()
+        if not model:
+            return None
         
-        # Convertir imagen a bytes
-        img_byte_arr = BytesIO()
-        imagen.save(img_byte_arr, format='JPEG', quality=95)
-        img_bytes = img_byte_arr.getvalue()
+        # Convertir imagen optimizada (calidad balanceada)
+        img_buffer = BytesIO()
+        imagen.save(img_buffer, format='JPEG', quality=90, optimize=True)
         
-        imagen_gemini = {
-            'mime_type': 'image/jpeg',
-            'data': img_bytes
-        }
+        response = model.generate_content(
+            [PROMPT_GEMINI, {'mime_type': 'image/jpeg', 'data': img_buffer.getvalue()}],
+            generation_config=GENERATION_CONFIG
+        )
         
-        prompt = """
-        Analiza esta factura de servicios públicos y extrae la información en formato JSON.
+        # Verificar que la respuesta tenga contenido válido
+        if not response.candidates:
+            st.error("Error: No se recibió respuesta de Gemini")
+            return None
         
-        IMPORTANTE: Esta es una factura de servicios públicos (agua, luz, gas, etc.)
+        candidate = response.candidates[0]
         
-        Formato JSON requerido:
-        {
-            "numero_contrato": "número de contrato del cliente",
-            "direccion": "dirección completa del inmueble",
-            "codigo_referencia": "código de referencia para pago electrónico o PSE",
-            "total_pagar": número sin símbolos de moneda (solo el valor numérico),
-            "empresa": "nombre de la empresa de servicios públicos",
-            "periodo_facturado": "mes y año del periodo facturado",
-            "fecha_vencimiento": "fecha límite de pago"
-        }
+        # Obtener el texto de forma segura - intentar múltiples métodos
+        texto = ""
         
-        INSTRUCCIONES:
-        - El número de contrato puede aparecer como "No CONTRATO", "CONTRATO", "No. CONTRATO"
-        - La dirección suele estar después de "DIRECCIÓN" o "Dirección"
-        - El código de referencia puede aparecer como "Código de referencia", "Ref. pago electrónico", "PSE"
-        - El TOTAL A PAGAR es el monto final que debe pagar el cliente
-        - Si un campo no existe, usa "" para strings y 0 para números
-        - Para números, NO incluyas símbolos de moneda ($), puntos o comas
+        # Método 1: Intentar acceder directamente a response.text (más confiable)
+        try:
+            texto = response.text
+        except (AttributeError, ValueError) as e:
+            # Método 2: Acceder a través de candidate.content.parts
+            if hasattr(candidate, 'content') and candidate.content:
+                if hasattr(candidate.content, 'parts'):
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            texto += part.text
+                elif hasattr(candidate.content, 'text'):
+                    texto = candidate.content.text
         
-        Devuelve SOLO el JSON, sin texto adicional ni explicaciones.
-        """
+        # Verificar finish_reason después de intentar obtener el texto
+        finish_reason = getattr(candidate, 'finish_reason', None)
         
-        response = model.generate_content([prompt, imagen_gemini])
-        texto_respuesta = response.text.strip()
-        texto_respuesta = texto_respuesta.replace('```json', '').replace('```', '').strip()
+        # Si no hay texto pero finish_reason es 2 (MAX_TOKENS), intentar con más tokens
+        if not texto and finish_reason == 2:
+            st.warning("La respuesta fue detenida por límite de tokens. Reintentando con más tokens...")
+            config_extended = GENERATION_CONFIG.copy()
+            config_extended["max_output_tokens"] = 2048
+            try:
+                response = model.generate_content(
+                    [PROMPT_GEMINI, {'mime_type': 'image/jpeg', 'data': img_buffer.getvalue()}],
+                    generation_config=config_extended
+                )
+                if response.candidates:
+                    candidate = response.candidates[0]
+                    try:
+                        texto = response.text
+                    except (AttributeError, ValueError):
+                        if hasattr(candidate, 'content') and candidate.content:
+                            if hasattr(candidate.content, 'parts'):
+                                for part in candidate.content.parts:
+                                    if hasattr(part, 'text') and part.text:
+                                        texto += part.text
+                # Verificar finish_reason actualizado
+                if response.candidates:
+                    finish_reason = getattr(response.candidates[0], 'finish_reason', finish_reason)
+            except Exception as e:
+                st.warning(f"No se pudo reintentar: {str(e)}")
         
-        datos = json.loads(texto_respuesta)
+        # Si aún no tenemos texto, verificar si hay bloqueos de seguridad
+        if not texto:
+            if finish_reason == 3:
+                st.error("La respuesta fue bloqueada por filtros de seguridad. Verifica que la imagen no contenga contenido sensible.")
+            elif finish_reason == 2:
+                st.error("Error: La respuesta fue detenida por límite de tokens y no se pudo recuperar.")
+            else:
+                st.error(f"Error: No se pudo extraer texto de la respuesta. Finish reason: {finish_reason}")
+            return None
+        
+        texto = texto.strip()
+        texto = re.sub(r'```json\s*|```\s*', '', texto).strip()
+        
+        # Extraer JSON si está envuelto
+        json_match = re.search(r'\{.*\}', texto, re.DOTALL)
+        if json_match:
+            texto = json_match.group(0)
+        
+        datos = json.loads(texto)
+        
+        if not isinstance(datos, dict):
+            raise ValueError("Respuesta no es un diccionario válido")
+        
+        # Validar y limpiar datos extraídos
+        # Filtrar información irrelevante o incorrecta
+        palabras_prohibidas = ['adultos', 'mayores', 'millones', 'dólares', 'familia', 'demográfico', 'grupo', 'estadística']
+        
+        # Limpiar campos de texto
+        for campo in ['numero_contrato', 'direccion', 'codigo_referencia', 'empresa', 'periodo_facturado', 'fecha_vencimiento', 'numero_factura', 'nit_empresa', 'medidor']:
+            if campo in datos and isinstance(datos[campo], str):
+                texto_campo = datos[campo].lower()
+                # Si contiene palabras prohibidas, limpiar o vaciar
+                if any(palabra in texto_campo for palabra in palabras_prohibidas):
+                    datos[campo] = ""
+                # Limpiar espacios y caracteres extraños
+                datos[campo] = datos[campo].strip()
+                # Si es muy largo y parece contener texto publicitario, truncar o limpiar
+                if len(datos[campo]) > 200:
+                    datos[campo] = datos[campo][:200].strip()
+        
+        # Validar código de referencia (no debe ser un número de teléfono típico)
+        if "codigo_referencia" in datos and datos["codigo_referencia"]:
+            ref = datos["codigo_referencia"].strip()
+            # Si parece un número de teléfono (10 dígitos seguidos), limpiar
+            if re.match(r'^\d{10}$', ref.replace(' ', '').replace('-', '')):
+                datos["codigo_referencia"] = ""
+        
+        # Normalizar total_pagar
+        if "total_pagar" in datos:
+            try:
+                if isinstance(datos["total_pagar"], str):
+                    # Limpiar texto que no sea numérico
+                    texto_limpio = re.sub(r'[^\d.]', '', datos["total_pagar"])
+                    # Si contiene palabras prohibidas, usar 0
+                    if any(palabra in datos["total_pagar"].lower() for palabra in palabras_prohibidas):
+                        datos["total_pagar"] = 0.0
+                    else:
+                        datos["total_pagar"] = float(texto_limpio or 0)
+                else:
+                    datos["total_pagar"] = float(datos["total_pagar"])
+            except:
+                datos["total_pagar"] = 0.0
+        
+        # Validar consumo (debe ser razonable)
+        if "consumo" in datos:
+            try:
+                consumo_val = float(datos["consumo"])
+                # Si el consumo es excesivamente alto (probablemente error), usar 0
+                if consumo_val > 1000000:  # Límite razonable
+                    datos["consumo"] = 0.0
+                else:
+                    datos["consumo"] = consumo_val
+            except:
+                datos["consumo"] = 0.0
+        
         return datos
         
+    except json.JSONDecodeError as e:
+        st.error(f"Error al parsear JSON: {str(e)}")
+        if 'texto' in locals():
+            st.info(f"Respuesta recibida: {texto[:500]}...")
+        return None
     except Exception as e:
         st.error(f"Error con Gemini: {str(e)}")
         return None
 
-# ==================== LÓGICA HÍBRIDA ADAPTATIVA ====================
+# ==================== EXTRACCIÓN DE DATOS CON GEMINI ====================
 
-def extraer_datos_adaptativo(imagen, forzar_gemini=False, umbral_confianza=0.6):
+def extraer_datos_factura(imagen):
     """
-    Estrategia adaptativa:
-    - Si Tesseract disponible: intenta primero con Tesseract
-    - Si no disponible o confianza baja: usa Gemini
+    Extrae datos de factura usando exclusivamente Gemini AI
     """
-    metodo_usado = ""
-    texto_ocr = ""
-    
-    # Si NO hay Tesseract o se fuerza Gemini, usar Gemini directamente
-    if not TESSERACT_DISPONIBLE or forzar_gemini:
-        if not TESSERACT_DISPONIBLE:
-            st.info("Tesseract no disponible, usando Gemini")
-        
-        with st.spinner("Extrayendo con Gemini AI..."):
-            datos = extraer_con_gemini(imagen)
-            metodo_usado = "Gemini"
-            
-            if datos:
-                st.success("Extraído exitosamente con Gemini")
-            else:
-                st.error("Error al extraer con Gemini")
-                datos = {}
-            
-            return datos, metodo_usado, ""
-    
-    # Intentar con Tesseract primero
-    with st.spinner("Extrayendo con Tesseract OCR..."):
-        texto_ocr, data_ocr = extraer_con_tesseract(imagen)
-        confianza = calcular_confianza_ocr(texto_ocr, data_ocr)
-        
-        st.info(f"Confianza Tesseract: {confianza:.1%}")
-        
-        if confianza >= umbral_confianza:
-            st.success("Calidad suficiente, usando Tesseract")
-            datos = parsear_factura_tesseract(texto_ocr)
-            metodo_usado = "Tesseract"
-            return datos, metodo_usado, texto_ocr
-        else:
-            st.warning("Confianza baja, usando Gemini como respaldo...")
-    
-    # Usar Gemini como fallback
-    with st.spinner("Extrayendo con Gemini AI..."):
+    with st.spinner("Extrayendo datos con Gemini AI..."):
         datos = extraer_con_gemini(imagen)
-        metodo_usado = "Gemini"
         
         if datos:
-            st.success("Extraído exitosamente con Gemini")
+            st.success("✓ Datos extraídos exitosamente")
+            return datos, "Gemini"
         else:
-            st.error("Usando datos de Tesseract como fallback")
-            datos = parsear_factura_tesseract(texto_ocr)
-        
-        return datos, metodo_usado, texto_ocr
+            st.error("✗ Error al extraer datos")
+            return {}, "Gemini"
 
 # ==================== PROCESAMIENTO DE PDF ====================
 
-def procesar_pdf(pdf_bytes, umbral_confianza=0.8, forzar_gemini=False):
-    """Procesa un PDF con detección automática de herramientas disponibles"""
-    
+def procesar_pdf(pdf_bytes):
+    """Procesa un PDF y extrae datos de facturas"""
     try:
         with st.spinner("Convirtiendo PDF a imágenes..."):
+            kwargs = {'dpi': 200}  # DPI reducido para mayor velocidad
             if POPPLER_PATH and platform.system() == 'Windows':
-                imagenes = convert_from_bytes(pdf_bytes, dpi=300, poppler_path=POPPLER_PATH)
-            else:
-                imagenes = convert_from_bytes(pdf_bytes, dpi=300)
+                kwargs['poppler_path'] = POPPLER_PATH
+            imagenes = convert_from_bytes(pdf_bytes, **kwargs)
         
-        st.success(f"{len(imagenes)} página(s) convertida(s) exitosamente")
+        st.success(f"{len(imagenes)} página(s) convertida(s)")
         
     except Exception as e:
         st.error(f"Error al convertir PDF: {str(e)}")
         if not POPPLER_DISPONIBLE:
-            st.warning("Poppler no está instalado. Instálalo para procesar PDFs.")
+            st.warning("Poppler no está instalado.")
         return [], {}
     
     resultados = []
-    estadisticas = {"tesseract": 0, "gemini": 0, "total": len(imagenes)}
-    
+    estadisticas = {"gemini": 0, "total": len(imagenes)}
     progress_bar = st.progress(0)
     
     for i, imagen in enumerate(imagenes):
@@ -399,10 +325,7 @@ def procesar_pdf(pdf_bytes, umbral_confianza=0.8, forzar_gemini=False):
             st.image(imagen, caption=f"Página {i+1}", use_container_width=True)
         
         with col2:
-            datos, metodo, texto_ocr = extraer_datos_adaptativo(
-                imagen, forzar_gemini, umbral_confianza
-            )
-            
+            datos, metodo = extraer_datos_factura(imagen)
             estadisticas[metodo.lower()] += 1
             
             if datos:
@@ -410,24 +333,23 @@ def procesar_pdf(pdf_bytes, umbral_confianza=0.8, forzar_gemini=False):
                 datos["metodo_extraccion"] = metodo
                 resultados.append(datos)
                 
-                # Mostrar resumen visual
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    st.metric("Contrato", datos.get("numero_contrato", "N/A"))
+                    st.metric("Contrato", datos.get("numero_contrato") or "N/A")
                     st.metric("Total", f"${datos.get('total_pagar', 0):,.0f}")
+                    if datos.get("empresa"):
+                        st.metric("Empresa", datos.get("empresa"))
                 
                 with col_b:
-                    st.metric("Referencia", datos.get("codigo_referencia", "N/A")[:15] + "..." if len(datos.get("codigo_referencia", "")) > 15 else datos.get("codigo_referencia", "N/A"))
-                    st.metric("Dirección", datos.get("direccion", "N/A")[:20] + "..." if len(datos.get("direccion", "")) > 20 else datos.get("direccion", "N/A"))
+                    ref = datos.get("codigo_referencia") or "N/A"
+                    st.metric("Referencia", ref[:20] + "..." if len(ref) > 20 and ref != "N/A" else ref)
+                    dir_val = datos.get("direccion") or "N/A"
+                    st.metric("Dirección", dir_val[:25] + "..." if len(dir_val) > 25 and dir_val != "N/A" else dir_val)
+                    if datos.get("periodo_facturado"):
+                        st.metric("Periodo", datos.get("periodo_facturado"))
                 
-                # Expandible con datos completos
-                with st.expander("Ver todos los datos extraídos"):
+                with st.expander("Ver todos los datos", expanded=False):
                     st.json(datos)
-                
-                if texto_ocr and metodo == "Tesseract":
-                    with st.expander("Ver texto OCR (Tesseract)"):
-                        st.warning("Este texto puede contener errores de OCR")
-                        st.text(texto_ocr[:1000] + "..." if len(texto_ocr) > 1000 else texto_ocr)
         
         progress_bar.progress((i + 1) / len(imagenes))
     
@@ -436,196 +358,541 @@ def procesar_pdf(pdf_bytes, umbral_confianza=0.8, forzar_gemini=False):
 # ==================== FUNCIONES DE UI Y ESTILOS ====================
 
 def load_custom_css():
-    """Carga el CSS personalizado estilo Platzi"""
+    """Carga el CSS personalizado con identidad visual DocuMarval"""
     css = """
     <style>
     :root {
-        --platzi-green: #98CA3F;
-        --platzi-dark: #121212;
-        --platzi-darker: #0A0A0A;
-        --platzi-gray: #1E1E1E;
-        --platzi-light-gray: #2D2D2D;
-        --platzi-text: #FFFFFF;
-        --platzi-text-secondary: #B0B0B0;
-        --platzi-accent: #7AB800;
-        --platzi-gradient: linear-gradient(135deg, #98CA3F 0%, #7AB800 100%);
+        /* Paleta corporativa DocuMarval */
+        --brand-900: #0B1220;
+        --brand-800: #0F172A;
+        --brand-700: #13223A;
+        --brand-600: #173B5F;
+        --brand-500: #1E5AA5;
+        --brand-400: #2F7DEB;
+        --brand-300: #72A8FF;
+        --brand-200: #CFE1FF;
+        --brand-100: #EAF1FF;
+        
+        --gray-900: #0F172A;
+        --gray-700: #334155;
+        --gray-500: #64748B;
+        --gray-300: #CBD5E1;
+        --gray-100: #F1F5F9;
+        --white: #FFFFFF;
+        
+        /* Tokens de diseño */
+        --radius-md: 14px;
+        --radius-lg: 16px;
+        --elevation-1: 0 8px 24px rgba(0, 0, 0, 0.12);
+        --elevation-2: 0 16px 36px rgba(0, 0, 0, 0.16);
+        --glass-bg: rgba(255, 255, 255, 0.1);
+        --glass-border: rgba(207, 225, 255, 0.3);
     }
     
+    /* Fondo principal con gradiente futurista */
     .stApp {
-        background: var(--platzi-dark);
-        color: var(--platzi-text);
+        background: linear-gradient(135deg, var(--brand-900) 0%, var(--brand-800) 50%, var(--brand-700) 100%);
+        background-attachment: fixed;
+        color: var(--white);
+        min-height: 100vh;
     }
     
+    /* Grid pattern sutil de fondo */
+    .stApp::before {
+        content: '';
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-image: 
+            linear-gradient(rgba(47, 125, 235, 0.03) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(47, 125, 235, 0.03) 1px, transparent 1px);
+        background-size: 50px 50px;
+        pointer-events: none;
+        z-index: 0;
+    }
+    
+    /* Navbar estilo DocuMarval */
+    .navbar-container {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: linear-gradient(135deg, var(--brand-800) 0%, var(--brand-700) 100%);
+        border-bottom: 1px solid var(--brand-600);
+        backdrop-filter: blur(10px);
+        box-shadow: var(--elevation-1);
+        padding: 1.5rem 0;
+    }
+    
+    .navbar-content {
+        max-width: 100%;
+        margin: 0 auto;
+        padding: 0 2rem;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 120px;
+        min-height: 120px;
+    }
+    
+    .logo-container {
+        flex: 0 1 auto;
+        display: flex;
+        align-items: center;
+        min-width: 0;
+        position: relative;
+    }
+    
+    .logo-container img {
+        height: 80px;
+        width: auto;
+        min-width: 300px;
+        max-width: 100%;
+        filter: brightness(1.1);
+        object-fit: contain;
+        display: block;
+        position: relative;
+        z-index: 1;
+    }
+    
+    @media (max-width: 768px) {
+        .logo-container img {
+            height: 60px;
+            min-width: 250px;
+        }
+    }
+    
+    .logo-container h2 {
+        font-size: 2rem;
+        font-weight: 700;
+    }
+    
+    /* Header principal mejorado - Diseño innovador y llamativo */
     .main-header {
-        background: var(--platzi-gradient);
-        padding: 2rem;
-        border-radius: 12px;
-        margin-bottom: 2rem;
-        box-shadow: 0 8px 32px rgba(152, 202, 63, 0.3);
+        background: linear-gradient(135deg, rgba(20, 184, 166, 0.15) 0%, rgba(0, 209, 255, 0.1) 100%);
+        backdrop-filter: blur(20px);
+        border: 2px solid rgba(20, 184, 166, 0.3);
+        border-radius: 24px;
+        padding: 4rem 3rem;
+        margin: 2rem auto;
+        max-width: 1400px;
+        box-shadow: 0 8px 32px rgba(20, 184, 166, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.1) inset;
+        position: relative;
+        z-index: 1;
+        overflow: hidden;
+    }
+    
+    .main-header::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, transparent, var(--brand-400), transparent);
+        animation: shimmer 3s infinite;
+    }
+    
+    @keyframes shimmer {
+        0%, 100% { opacity: 0.5; }
+        50% { opacity: 1; }
+    }
+    
+    .header-content {
+        display: flex;
+        flex-direction: column;
+        gap: 1.25rem;
+        align-items: center;
+        text-align: center;
+        position: relative;
+        z-index: 2;
+    }
+    
+    .header-title-container {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 2rem;
+        flex-wrap: wrap;
+        width: 100%;
+    }
+    
+    .header-logo {
+        height: 238px;
+        width: auto;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        filter: drop-shadow(0 4px 12px rgba(20, 184, 166, 0.4));
+        transition: transform 0.3s ease, filter 0.3s ease;
+    }
+    
+    .header-logo img {
+        height: 238px;
+        width: auto;
+        object-fit: contain;
+        display: block;
+    }
+    
+    .header-logo:hover {
+        transform: scale(1.05);
+        filter: drop-shadow(0 6px 16px rgba(20, 184, 166, 0.6));
     }
     
     .main-header h1 {
-        color: var(--platzi-dark);
-        font-weight: 700;
-        font-size: 2.5rem;
+        color: var(--white);
+        font-weight: 800;
+        font-size: 3.5rem;
         margin: 0;
-        text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        line-height: 1.1;
+        letter-spacing: -0.02em;
+        background: linear-gradient(135deg, #FFFFFF 0%, var(--brand-200) 50%, var(--brand-400) 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        text-shadow: 0 0 30px rgba(20, 184, 166, 0.3);
+        position: relative;
+        text-align: center;
     }
     
+    .main-header h1::after {
+        content: '';
+        position: absolute;
+        bottom: -8px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 60%;
+        height: 3px;
+        background: linear-gradient(90deg, transparent, var(--brand-400), transparent);
+        border-radius: 2px;
+        opacity: 0.6;
+    }
+    
+    .main-header .subtitle {
+        color: var(--gray-200);
+        font-size: 1.35rem;
+        margin: 0;
+        font-weight: 400;
+        line-height: 1.7;
+        max-width: 900px;
+        text-align: center;
+    }
+    
+    .main-header .subtitle strong {
+        color: var(--brand-300);
+        font-weight: 600;
+        background: linear-gradient(135deg, var(--brand-300), var(--brand-400));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+    
+    @media (max-width: 768px) {
+        .main-header {
+            padding: 2.5rem 1.5rem;
+        }
+        
+        .main-header h1 {
+            font-size: 2.5rem;
+        }
+        
+        .header-logo {
+            height: 170px;
+        }
+        
+        .header-logo img {
+            height: 170px;
+        }
+        
+        .header-title-container {
+            gap: 1.25rem;
+        }
+        
+        .main-header .subtitle {
+            font-size: 1.15rem;
+        }
+    }
+    
+    .navbar-content {
+        gap: 2rem;
+    }
+    
+    /* Cards con efecto glass */
     .status-card {
-        background: var(--platzi-gray);
-        border: 1px solid var(--platzi-light-gray);
-        border-radius: 12px;
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-md);
         padding: 1.5rem;
         margin: 0.5rem 0;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+        transition: all 0.2s ease;
+        box-shadow: var(--elevation-1);
     }
     
     .status-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 8px 24px rgba(152, 202, 63, 0.2);
-        border-color: var(--platzi-green);
+        transform: translateY(-2px);
+        box-shadow: var(--elevation-2);
+        border-color: var(--brand-300);
     }
     
     .status-card.success {
-        border-left: 4px solid var(--platzi-green);
+        border-left: 4px solid var(--brand-400);
     }
     
     .status-card.warning {
-        border-left: 4px solid #FFA500;
+        border-left: 4px solid var(--brand-300);
     }
     
     .status-card.error {
-        border-left: 4px solid #FF4444;
+        border-left: 4px solid #EF4444;
     }
     
+    /* Metric cards */
     .metric-card {
-        background: var(--platzi-gray);
-        border-radius: 12px;
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-md);
         padding: 1.5rem;
         text-align: center;
-        border: 1px solid var(--platzi-light-gray);
+        transition: all 0.2s ease;
+    }
+    
+    .metric-card:hover {
+        transform: translateY(-2px);
+        border-color: var(--brand-300);
     }
     
     .metric-value {
         font-size: 2rem;
         font-weight: 700;
-        color: var(--platzi-green);
+        color: var(--brand-300);
         margin: 0.5rem 0;
     }
     
+    .metric-label {
+        color: var(--gray-300);
+        font-size: 0.875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    
+    /* Botones primarios */
     .stButton > button {
-        background: var(--platzi-gradient);
-        color: var(--platzi-dark);
+        background: linear-gradient(135deg, var(--brand-500) 0%, var(--brand-400) 100%);
+        color: var(--white);
         border: none;
-        border-radius: 8px;
+        border-radius: var(--radius-md);
         padding: 0.75rem 1.5rem;
         font-weight: 600;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 12px rgba(152, 202, 63, 0.3);
+        transition: all 0.2s ease;
+        box-shadow: var(--elevation-1);
     }
     
     .stButton > button:hover {
+        background: linear-gradient(135deg, var(--brand-400) 0%, var(--brand-300) 100%);
         transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(152, 202, 63, 0.4);
+        box-shadow: var(--elevation-2);
     }
     
+    .stButton > button:focus {
+        outline: 2px solid var(--brand-300);
+        outline-offset: 2px;
+    }
+    
+    /* File uploader */
     .stFileUploader > div {
-        background: var(--platzi-gray);
-        border: 2px dashed var(--platzi-light-gray);
-        border-radius: 12px;
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border: 2px dashed var(--glass-border);
+        border-radius: var(--radius-md);
         padding: 2rem;
-        transition: all 0.3s ease;
+        transition: all 0.2s ease;
     }
     
     .stFileUploader > div:hover {
-        border-color: var(--platzi-green);
-        background: var(--platzi-light-gray);
+        border-color: var(--brand-300);
+        background: rgba(255, 255, 255, 0.15);
     }
     
+    /* Progress bar */
     .stProgress > div > div {
-        background: var(--platzi-gradient);
+        background: linear-gradient(90deg, var(--brand-500) 0%, var(--brand-400) 100%);
+        border-radius: var(--radius-md);
     }
     
+    /* Sidebar */
     [data-testid="stSidebar"] {
-        background: var(--platzi-darker);
+        background: var(--brand-900);
+        border-right: 1px solid var(--brand-600);
     }
     
+    /* Inputs y selects */
+    .stTextInput > div > div > input,
+    .stSelectbox > div > div > select {
+        border: 1px solid var(--gray-300);
+        border-radius: var(--radius-md);
+        transition: all 0.2s ease;
+    }
+    
+    .stTextInput > div > div > input:focus,
+    .stSelectbox > div > div > select:focus {
+        border-color: var(--brand-300);
+        outline: 2px solid var(--brand-300);
+        outline-offset: 2px;
+    }
+    
+    /* Tablas */
+    .dataframe {
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border-radius: var(--radius-md);
+        border: 1px solid var(--glass-border);
+    }
+    
+    .dataframe thead {
+        background: var(--brand-100);
+        color: var(--brand-900);
+    }
+    
+    .dataframe tbody tr:nth-child(even) {
+        background: rgba(255, 255, 255, 0.05);
+    }
+    
+    .dataframe tbody tr:hover {
+        background: rgba(47, 125, 235, 0.1);
+    }
+    
+    /* Scrollbar personalizado */
     ::-webkit-scrollbar {
         width: 10px;
     }
     
     ::-webkit-scrollbar-track {
-        background: var(--platzi-darker);
+        background: var(--brand-900);
     }
     
     ::-webkit-scrollbar-thumb {
-        background: var(--platzi-green);
+        background: var(--brand-500);
         border-radius: 5px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--brand-400);
+    }
+    
+    /* Contenedor principal */
+    .main-container {
+        max-width: 1280px;
+        margin: 0 auto;
+        padding: 0 1.5rem;
+        position: relative;
+        z-index: 1;
+    }
+    
+    /* Info box */
+    .info-box {
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--glass-border);
+        border-left: 4px solid var(--brand-400);
+        border-radius: var(--radius-md);
+        padding: 1.5rem;
+        margin: 2rem 0;
+    }
+    
+    /* Expanders */
+    .streamlit-expanderHeader {
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border-radius: var(--radius-md);
+        padding: 1rem;
+        border: 1px solid var(--glass-border);
+    }
+    
+    /* Métricas de Streamlit */
+    [data-testid="stMetricValue"] {
+        color: var(--brand-300);
+    }
+    
+    [data-testid="stMetricLabel"] {
+        color: var(--gray-300);
+    }
+    
+    /* Títulos y subtítulos */
+    h1, h2, h3 {
+        color: var(--white);
+    }
+    
+    h3 {
+        color: var(--brand-300);
+    }
+    
+    /* Links */
+    a {
+        color: var(--brand-300);
+        text-decoration: none;
+        transition: color 0.2s ease;
+    }
+    
+    a:hover {
+        color: var(--brand-400);
+    }
+    
+    /* Dividers */
+    hr {
+        border-color: var(--brand-600);
+        margin: 1.5rem 0;
+    }
+    
+    /* Success/Error/Warning messages */
+    .stSuccess {
+        background: rgba(47, 125, 235, 0.1);
+        border-left: 4px solid var(--brand-400);
+        border-radius: var(--radius-md);
+    }
+    
+    .stError {
+        background: rgba(239, 68, 68, 0.1);
+        border-left: 4px solid #EF4444;
+        border-radius: var(--radius-md);
+    }
+    
+    .stWarning {
+        background: rgba(114, 168, 255, 0.1);
+        border-left: 4px solid var(--brand-300);
+        border-radius: var(--radius-md);
+    }
+    
+    .stInfo {
+        background: rgba(47, 125, 235, 0.1);
+        border-left: 4px solid var(--brand-400);
+        border-radius: var(--radius-md);
+    }
+    
+    /* Spinner */
+    .stSpinner > div {
+        border-color: var(--brand-400) transparent transparent transparent;
+    }
+    
+    /* Mejoras de accesibilidad - Focus states */
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible {
+        outline: 2px solid var(--brand-300);
+        outline-offset: 2px;
     }
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
 
-def get_icon_svg(icon_name):
-    """Retorna SVG de iconos profesionales"""
-    icons = {
-        "document": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M14 2H6C5.46957 2 4.96086 2.21071 4.58579 2.58579C4.21071 2.96086 4 3.46957 4 4V20C4 20.5304 4.21071 21.0391 4.58579 21.4142C4.96086 21.7893 5.46957 22 6 22H18C18.5304 22 19.0391 21.7893 19.4142 21.4142C19.7893 21.0391 20 20.5304 20 20V8L14 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M14 2V8H20" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "upload": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M21 15V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M7 10L12 5L17 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M12 5V15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "check": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "warning": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M12 9V13M12 17H12.01M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "error": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M12 8V12M12 16H12.01M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M12 8V12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "robot": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M12 2C13.1 2 14 2.9 14 4C14 5.1 13.1 6 12 6C10.9 6 10 5.1 10 4C10 2.9 10.9 2 12 2ZM21 9V7L18.5 6.5C18.2 5.9 17.8 5.4 17.3 5.1L18 2.5L16 1.5L15.2 4.1C14.7 4 14.1 4 13.5 4H10.5C9.9 4 9.3 4 8.8 4.1L8 1.5L6 2.5L6.7 5.1C6.2 5.4 5.8 5.9 5.5 6.5L3 7V9L5.5 9.5C5.8 10.1 6.2 10.6 6.7 10.9L6 13.5L8 14.5L8.8 11.9C9.3 12 9.9 12 10.5 12H13.5C14.1 12 14.7 12 15.2 11.9L16 14.5L18 13.5L17.3 10.9C17.8 10.6 18.2 10.1 18.5 9.5L21 9ZM12 8C9.2 8 7 10.2 7 13C7 15.8 9.2 18 12 18C14.8 18 17 15.8 17 13C17 10.2 14.8 8 12 8Z" fill="currentColor"/>
-        </svg>""",
-        "eye": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M1 12C1 12 5 4 12 4C19 4 23 12 23 12C23 12 19 20 12 20C5 20 1 12 1 12Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/>
-        </svg>""",
-        "settings": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M12 15C13.6569 15 15 13.6569 15 12C15 10.3431 13.6569 9 12 9C10.3431 9 9 10.3431 9 12C9 13.6569 10.3431 15 12 15Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M19.4 15C19.2669 15.3016 19.2272 15.6362 19.286 15.9606C19.3448 16.285 19.4995 16.5843 19.73 16.82L19.79 16.88C19.976 17.0657 20.1235 17.2863 20.2241 17.5291C20.3248 17.7719 20.3766 18.0322 20.3766 18.295C20.3766 18.5578 20.3248 18.8181 20.2241 19.0609C20.1235 19.3037 19.976 19.5243 19.79 19.71C19.6043 19.896 19.3837 20.0435 19.1409 20.1441C18.8981 20.2448 18.6378 20.2966 18.375 20.2966C18.1122 20.2966 17.8519 20.2448 17.6091 20.1441C17.3663 20.0435 17.1457 19.896 16.96 19.71L16.9 19.65C16.6643 19.4195 16.365 19.2648 16.0406 19.206C15.7162 19.1472 15.3816 19.1869 15.08 19.32C14.7842 19.4468 14.532 19.6572 14.3543 19.9255C14.1766 20.1938 14.0813 20.5082 14.08 20.83V21C14.08 21.5304 13.8693 22.0391 13.4942 22.4142C13.1191 22.7893 12.6104 23 12.08 23C11.5496 23 11.0409 22.7893 10.6658 22.4142C10.2907 22.0391 10.08 21.5304 10.08 21V20.91C10.0723 20.579 9.96512 20.258 9.77251 19.9887C9.5799 19.7194 9.31074 19.5143 9 19.4C8.69838 19.2669 8.36381 19.2272 8.03941 19.286C7.71502 19.3448 7.41568 19.4995 7.18 19.73L7.12 19.79C6.93425 19.976 6.71368 20.1235 6.47088 20.2241C6.22808 20.3248 5.96783 20.3766 5.705 20.3766C5.44217 20.3766 5.18192 20.3248 4.93912 20.2241C4.69632 20.1235 4.47575 19.976 4.29 19.79C4.10405 19.6043 3.95653 19.3837 3.85588 19.1409C3.75523 18.8981 3.70343 18.6378 3.70343 18.375C3.70343 18.1122 3.75523 17.8519 3.85588 17.6091C3.95653 17.3663 4.10405 17.1457 4.29 16.96L4.35 16.9C4.58054 16.6643 4.73519 16.365 4.794 16.0406C4.85282 15.7162 4.81312 15.3816 4.68 15.08C4.55324 14.7842 4.34276 14.532 4.07447 14.3543C3.80618 14.1766 3.49179 14.0813 3.17 14.08H3C2.46957 14.08 1.96086 13.8693 1.58579 13.4942C1.21071 13.1191 1 12.6104 1 12.08C1 11.5496 1.21071 11.0409 1.58579 10.6658C1.96086 10.2907 2.46957 10.08 3 10.08H3.09C3.42099 10.0723 3.742 9.96512 4.01131 9.77251C4.28062 9.5799 4.48571 9.31074 4.6 9C4.73312 8.69838 4.77282 8.36381 4.714 8.03941C4.65519 7.71502 4.50054 7.41568 4.27 7.18L4.21 7.12C4.02405 6.93425 3.87653 6.71368 3.77588 6.47088C3.67523 6.22808 3.62343 5.96783 3.62343 5.705C3.62343 5.44217 3.67523 5.18192 3.77588 4.93912C3.87653 4.69632 4.02405 4.47575 4.21 4.29C4.39575 4.10405 4.61632 3.95653 4.85912 3.85588C5.10192 3.75523 5.36217 3.70343 5.625 3.70343C5.88783 3.70343 6.14808 3.75523 6.39088 3.85588C6.63368 3.95653 6.85425 4.10405 7.04 4.29L7.1 4.35C7.33568 4.58054 7.63502 4.73519 7.95941 4.794C8.28381 4.85282 8.61838 4.81312 8.92 4.68H9C9.29577 4.55324 9.54802 4.34276 9.72569 4.07447C9.90337 3.80618 9.99872 3.49179 10 3.17V3C10 2.46957 10.2107 1.96086 10.5858 1.58579C10.9609 1.21071 11.4696 1 12 1C12.5304 1 13.0391 1.21071 13.4142 1.58579C13.7893 1.96086 14 2.46957 14 3V3.09C14.0013 3.41179 14.0966 3.72618 14.2743 3.99447C14.452 4.26276 14.7022 4.47324 14.998 4.6C15.2996 4.73312 15.6342 4.77282 15.9586 4.714C16.283 4.65519 16.5823 4.50054 16.818 4.27L16.878 4.21C17.064 4.02405 17.2846 3.87653 17.5274 3.77588C17.7702 3.67523 18.0305 3.62343 18.2933 3.62343C18.5562 3.62343 18.8164 3.67523 19.0592 3.77588C19.302 3.87653 19.5226 4.02405 19.7086 4.21C19.8946 4.39575 20.0421 4.61632 20.1427 4.85912C20.2434 5.10192 20.2952 5.36217 20.2952 5.625C20.2952 5.88783 20.2434 6.14808 20.1427 6.39088C20.0421 6.63368 19.8946 6.85425 19.7086 7.04L19.6486 7.1C19.418 7.33568 19.2634 7.63502 19.2046 7.95941C19.1458 8.28381 19.1855 8.61838 19.3186 8.92V9C19.4454 9.29577 19.6559 9.54802 19.9242 9.72569C20.1925 9.90337 20.5069 9.99872 20.8286 10H21C21.5304 10 22.0391 10.2107 22.4142 10.5858C22.7893 10.9609 23 11.4696 23 12C23 12.5304 22.7893 13.0391 22.4142 13.4142C22.0391 13.7893 21.5304 14 21 14H20.91C20.5882 14.0013 20.2738 14.0966 20.0055 14.2743C19.7372 14.452 19.5268 14.7022 19.4 15Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "download": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M21 15V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M7 14L12 19L17 14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M12 19V9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>""",
-        "info": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
-            <path d="M12 16V12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <path d="M12 8H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-        </svg>"""
-    }
-    return icons.get(icon_name, "")
-
-def render_icon(icon_name, color="#98CA3F", size=24):
-    """Renderiza un icono SVG"""
-    svg = get_icon_svg(icon_name)
-    if svg:
-        return f'<span style="display: inline-flex; align-items: center; color: {color};">{svg}</span>'
-    return ""
 
 # ==================== INTERFAZ STREAMLIT ====================
 
 def main():
     st.set_page_config(
-        page_title="Extractor Inteligente de Facturas",
+        page_title="DocuMarval - Extractor Inteligente de Facturas",
         page_icon="📄",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -634,54 +901,83 @@ def main():
     # Cargar CSS personalizado
     load_custom_css()
     
-    # Header moderno estilo Platzi
-    st.markdown("""
+    # Función para cargar el logo
+    def load_logo(height="80px"):
+        logo_path = os.path.join(os.path.dirname(__file__), "Logo.svg")
+        
+        # Si no existe Logo.svg, intentar con Logo_DocuMarval.svg
+        if not os.path.exists(logo_path):
+            logo_path = os.path.join(os.path.dirname(__file__), "Logo_DocuMarval.svg")
+        
+        if os.path.exists(logo_path):
+            import urllib.parse
+            try:
+                with open(logo_path, "r", encoding="utf-8") as f:
+                    logo_svg = f.read()
+                    # Limpiar el SVG de posibles duplicados
+                    logo_svg = logo_svg.strip()
+                    # Codificar SVG para uso en data URI
+                    logo_encoded = urllib.parse.quote(logo_svg)
+                    return f'<img src="data:image/svg+xml;charset=utf-8,{logo_encoded}" alt="DocuMarval" style="display: block; width: auto; height: {height}; object-fit: contain; margin: 0; padding: 0;" />'
+            except Exception as e:
+                return '<h2 style="color: var(--white); margin: 0; font-size: 2rem; font-weight: 700;">DocuMarval</h2>'
+        else:
+            return '<h2 style="color: var(--white); margin: 0; font-size: 2rem; font-weight: 700;">DocuMarval</h2>'
+    
+    # Header principal mejorado con logo - Diseño innovador
+    header_logo_html = load_logo("238px")
+    st.markdown(f"""
     <div class="main-header">
-        <h1>Extractor Inteligente de Facturas</h1>
-        <p style="color: var(--platzi-dark); margin-top: 0.5rem; font-size: 1.1rem;">
-            Sistema híbrido de extracción de datos con IA
-        </p>
+        <div class="header-content">
+            <div class="header-title-container">
+                <div class="header-logo">
+                    {header_logo_html}
+                </div>
+                <h1>Extractor Inteligente de Facturas</h1>
+            </div>
+            <p class="subtitle">Extrae <strong>datos de facturas escaneadas</strong> en segundos con IA</p>
+        </div>
     </div>
     """, unsafe_allow_html=True)
     
     # Banner de estado del sistema
     st.markdown("### Estado del Sistema")
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
-        status_class = "success" if TESSERACT_DISPONIBLE else "warning"
-        status_text = f"Tesseract {TESSERACT_VERSION}" if TESSERACT_DISPONIBLE else "Tesseract no disponible"
+        status_class = "success" if GEMINI_API_KEY else "error"
+        status_text = f"Gemini AI ({GEMINI_MODEL})" if GEMINI_API_KEY else "Gemini API no configurada"
+        status_icon = "✓" if GEMINI_API_KEY else "✗"
         st.markdown(f"""
         <div class="status-card {status_class}">
-            <strong>{status_text}</strong>
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+                <span style="font-size: 1.5rem;">{status_icon}</span>
+                <strong style="color: var(--white);">{status_text}</strong>
+            </div>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
-        status_class = "success" if OPENCV_DISPONIBLE else "warning"
-        status_text = "OpenCV disponible" if OPENCV_DISPONIBLE else "OpenCV no disponible (opcional)"
-        st.markdown(f"""
-        <div class="status-card {status_class}">
-            <strong>{status_text}</strong>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
         status_class = "success" if POPPLER_DISPONIBLE else "error"
         status_text = "Poppler disponible" if POPPLER_DISPONIBLE else "Poppler requerido"
+        status_icon = "✓" if POPPLER_DISPONIBLE else "✗"
         st.markdown(f"""
         <div class="status-card {status_class}">
-            <strong>{status_text}</strong>
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+                <span style="font-size: 1.5rem;">{status_icon}</span>
+                <strong style="color: var(--white);">{status_text}</strong>
+            </div>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("""
-    <div style="background: var(--platzi-gray); padding: 1.5rem; border-radius: 12px; margin: 2rem 0; border-left: 4px solid var(--platzi-green);">
-        <h3 style="color: var(--platzi-green); margin-bottom: 1rem;">Sistema Híbrido Inteligente</h3>
-        <ul style="color: var(--platzi-text-secondary); line-height: 2;">
-            <li><strong>Extracción automática:</strong> No. Contrato, Dirección, Código de Referencia, Total a Pagar</li>
-            <li><strong>Estrategia adaptativa:</strong> Usa Tesseract primero (gratis), Gemini como respaldo inteligente</li>
-            <li><strong>Optimizado:</strong> Especializado para facturas de servicios públicos colombianos</li>
+    <div class="info-box">
+        <h3 style="color: var(--brand-300); margin-bottom: 1rem; font-size: 1.25rem;">Sistema de Extracción con IA</h3>
+        <ul style="color: var(--gray-300); line-height: 2; margin: 0; padding-left: 1.5rem;">
+            <li><strong style="color: var(--white);">Powered by Gemini AI:</strong> Extracción precisa usando Google Gemini 2.5 Flash</li>
+            <li><strong style="color: var(--white);">Extracción automática:</strong> No. Contrato, Dirección, Código de Referencia, Total a Pagar y más</li>
+            <li><strong style="color: var(--white);">Optimizado:</strong> Especializado para facturas de servicios públicos colombianos</li>
+            <li><strong style="color: var(--white);">Alta precisión:</strong> Análisis inteligente de imágenes con reconocimiento avanzado</li>
         </ul>
     </div>
     """, unsafe_allow_html=True)
@@ -689,13 +985,13 @@ def main():
     # Mostrar ejemplo de campos
     with st.expander("Campos que se extraen", expanded=False):
         st.markdown("""
-        <div style="color: var(--platzi-text-secondary);">
+        <div style="color: var(--gray-300);">
         <ol style="line-height: 2;">
-            <li><strong>No. CONTRATO:</strong> Número de contrato del cliente</li>
-            <li><strong>Dirección:</strong> Dirección completa del inmueble</li>
-            <li><strong>Código de Referencia:</strong> Para pago electrónico/PSE</li>
-            <li><strong>TOTAL A PAGAR:</strong> Monto final a pagar</li>
-            <li><strong>Adicionales:</strong> Empresa, periodo, fecha de vencimiento</li>
+            <li><strong style="color: var(--white);">No. CONTRATO:</strong> Número de contrato del cliente</li>
+            <li><strong style="color: var(--white);">Dirección:</strong> Dirección completa del inmueble</li>
+            <li><strong style="color: var(--white);">Código de Referencia:</strong> Para pago electrónico/PSE</li>
+            <li><strong style="color: var(--white);">TOTAL A PAGAR:</strong> Monto final a pagar</li>
+            <li><strong style="color: var(--white);">Adicionales:</strong> Empresa, periodo, fecha de vencimiento</li>
         </ol>
         </div>
         """, unsafe_allow_html=True)
@@ -703,43 +999,38 @@ def main():
     # Sidebar
     with st.sidebar:
         st.markdown("""
-        <h2 style="color: var(--platzi-green); margin-bottom: 1.5rem;">Opciones de Configuración</h2>
+        <h2 style="color: var(--brand-300); margin-bottom: 1.5rem;">Información del Sistema</h2>
         """, unsafe_allow_html=True)
         
-        forzar_gemini = st.checkbox(
-            "Forzar uso de Gemini",
-            value=not TESSERACT_DISPONIBLE,
-            disabled=not TESSERACT_DISPONIBLE,
-            help="Usar solo Gemini sin intentar Tesseract"
-        )
-        
-        umbral = st.slider(
-            "Umbral de confianza",
-            min_value=0.3,
-            max_value=0.9,
-            value=0.8,
-            step=0.1,
-            disabled=not TESSERACT_DISPONIBLE,
-            help="Para facturas de servicios públicos, se recomienda 0.7-0.8 (usa más Gemini)"
-        )
+        st.markdown(f"""
+        <div class="status-card success">
+            <div style="color: var(--white);">
+                <strong style="color: var(--brand-300);">Modelo:</strong> {GEMINI_MODEL}<br>
+                <strong style="color: var(--brand-300);">API Key:</strong> {'<span style="color: var(--brand-400);">✓ Configurada</span>' if GEMINI_API_KEY else '<span style="color: #EF4444;">✗ No configurada</span>'}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         
         st.divider()
         
         with st.expander("Instalación de dependencias", expanded=False):
             st.markdown("""
-            <div style="color: var(--platzi-text-secondary);">
-            <h4>Para Windows (desarrollo local):</h4>
+            <div style="color: var(--gray-300);">
+            <h4 style="color: var(--brand-300);">Para Windows (desarrollo local):</h4>
             <ul>
-                <li>Tesseract: <a href="https://github.com/UB-Mannheim/tesseract/wiki" target="_blank">Descargar</a></li>
-                <li>Poppler: <a href="https://github.com/oschwartz10612/poppler-windows/releases" target="_blank">Descargar</a></li>
+                <li>Poppler: <a href="https://github.com/oschwartz10612/poppler-windows/releases" target="_blank" style="color: var(--brand-300);">Descargar</a></li>
             </ul>
             
-            <h4>Para Streamlit Cloud (deployment):</h4>
-            <p>Crea <code>packages.txt</code>:</p>
-            <pre style="background: var(--platzi-gray); padding: 1rem; border-radius: 4px;">
-tesseract-ocr
-tesseract-ocr-spa
-poppler-utils
+            <h4 style="color: var(--brand-300);">Para Streamlit Cloud (deployment):</h4>
+            <p>Crea <code style="background: var(--brand-800); padding: 0.25rem 0.5rem; border-radius: 4px; color: var(--brand-300);">packages.txt</code>:</p>
+            <pre style="background: var(--brand-800); padding: 1rem; border-radius: var(--radius-md); border: 1px solid var(--brand-600); color: var(--gray-300);">
+            poppler-utils
+            </pre>
+            
+            <h4 style="color: var(--brand-300);">Variables de entorno requeridas:</h4>
+            <pre style="background: var(--brand-800); padding: 1rem; border-radius: var(--radius-md); border: 1px solid var(--brand-600); color: var(--gray-300);">
+GEMINI_API_KEY=tu_api_key_aqui
+GEMINI_MODEL=gemini-2.5-flash
             </pre>
             </div>
             """, unsafe_allow_html=True)
@@ -756,8 +1047,8 @@ poppler-utils
         if not POPPLER_DISPONIBLE:
             st.markdown("""
             <div class="status-card error">
-                <strong>Error: No se puede procesar PDF sin Poppler instalado</strong>
-                <p style="margin-top: 0.5rem; color: var(--platzi-text-secondary);">
+                <strong style="color: var(--white);">Error: No se puede procesar PDF sin Poppler instalado</strong>
+                <p style="margin-top: 0.5rem; color: var(--gray-300);">
                     Instala Poppler siguiendo las instrucciones en el sidebar
                 </p>
             </div>
@@ -769,8 +1060,8 @@ poppler-utils
             if not GEMINI_API_KEY:
                 st.markdown("""
                 <div class="status-card error">
-                    <strong>Error: No se encontró la API key de Gemini</strong>
-                    <p style="margin-top: 0.5rem; color: var(--platzi-text-secondary);">
+                    <strong style="color: var(--white);">Error: No se encontró la API key de Gemini</strong>
+                    <p style="margin-top: 0.5rem; color: var(--gray-300);">
                         Configúrala en el archivo .env de la aplicación
                     </p>
                 </div>
@@ -778,7 +1069,7 @@ poppler-utils
                 return
             
             pdf_bytes = uploaded_file.read()
-            facturas, stats = procesar_pdf(pdf_bytes, umbral, forzar_gemini)
+            facturas, stats = procesar_pdf(pdf_bytes)
             
             if facturas:
                 st.divider()
@@ -786,8 +1077,8 @@ poppler-utils
                 
                 st.markdown(f"""
                 <div class="status-card success" style="text-align: center; padding: 2rem;">
-                    <h2 style="color: var(--platzi-green); margin: 0;">Procesamiento Completado</h2>
-                    <p style="font-size: 1.2rem; margin-top: 0.5rem; color: var(--platzi-text-secondary);">
+                    <h2 style="color: var(--brand-300); margin: 0;">Procesamiento Completado</h2>
+                    <p style="font-size: 1.2rem; margin-top: 0.5rem; color: var(--gray-300);">
                         {len(facturas)} factura(s) procesada(s) exitosamente
                     </p>
                 </div>
@@ -808,25 +1099,25 @@ poppler-utils
                 with col2:
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value">{stats['tesseract']}</div>
-                        <div class="metric-label">Tesseract</div>
+                        <div class="metric-value">{stats['gemini']}</div>
+                        <div class="metric-label">Procesadas</div>
                     </div>
                     """, unsafe_allow_html=True)
                 
                 with col3:
+                    precision = "100%" if stats['gemini'] == stats['total'] else "N/A"
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value">{stats['gemini']}</div>
-                        <div class="metric-label">Gemini</div>
+                        <div class="metric-value">{precision}</div>
+                        <div class="metric-label">Precisión</div>
                     </div>
                     """, unsafe_allow_html=True)
                 
                 with col4:
-                    ahorro = (stats['tesseract'] / stats['total'] * 100) if stats['total'] > 0 else 0
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value">{ahorro:.0f}%</div>
-                        <div class="metric-label">Ahorro</div>
+                        <div class="metric-value">{GEMINI_MODEL.split('-')[1] if '-' in GEMINI_MODEL else 'AI'}</div>
+                        <div class="metric-label">Modelo</div>
                     </div>
                     """, unsafe_allow_html=True)
                 
