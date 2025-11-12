@@ -10,6 +10,13 @@ import os
 import platform
 import subprocess
 from dotenv import load_dotenv
+import concurrent.futures
+import time
+import hashlib
+from collections import deque
+from PIL import Image, ImageEnhance
+import numpy as np
+import base64
 
 load_dotenv()
 
@@ -118,10 +125,109 @@ GENERATION_CONFIG = {
     "max_output_tokens": 2048,  # Aumentado para evitar truncamiento
 }
 
-def extraer_con_gemini(imagen):
-    """Extrae datos usando Gemini Vision optimizado"""
+# ==================== RATE LIMITING ====================
+
+class RateLimiter:
+    """Controla la tasa de llamadas a la API para evitar saturación"""
+    def __init__(self, max_calls=10, time_window=60):
+        self.max_calls = max_calls
+        self.time_window = time_window
+        self.calls = deque()
+    
+    def wait_if_needed(self):
+        """Espera si es necesario para respetar el límite de tasa"""
+        now = time.time()
+        # Limpiar llamadas antiguas
+        while self.calls and self.calls[0] < now - self.time_window:
+            self.calls.popleft()
+        
+        # Si excedemos el límite, esperar
+        if len(self.calls) >= self.max_calls:
+            sleep_time = self.time_window - (now - self.calls[0])
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                # Limpiar nuevamente después de esperar
+                now = time.time()
+                while self.calls and self.calls[0] < now - self.time_window:
+                    self.calls.popleft()
+        
+        self.calls.append(time.time())
+
+# Instancia global del rate limiter
+rate_limiter = RateLimiter(max_calls=10, time_window=60)
+
+# ==================== OPTIMIZACIÓN DE IMÁGENES ====================
+
+def optimizar_imagen_para_gemini(imagen):
+    """Optimiza imagen según tamaño para reducir tokens y mejorar procesamiento"""
+    # Convertir a RGB si es necesario
+    if imagen.mode != 'RGB':
+        imagen = imagen.convert('RGB')
+    
+    # Redimensionar si es muy grande (Gemini tiene límites)
+    max_dimension = 2048
+    if max(imagen.size) > max_dimension:
+        ratio = max_dimension / max(imagen.size)
+        nuevo_tamano = (int(imagen.size[0] * ratio), 
+                       int(imagen.size[1] * ratio))
+        imagen = imagen.resize(nuevo_tamano, Image.Resampling.LANCZOS)
+    
+    # Mejorar contraste ligeramente (mejora OCR)
+    enhancer = ImageEnhance.Contrast(imagen)
+    imagen = enhancer.enhance(1.1)
+    
+    # Calidad adaptativa: más alta para imágenes pequeñas
+    quality = 95 if max(imagen.size) < 1000 else 85
+    
+    img_buffer = BytesIO()
+    imagen.save(img_buffer, format='JPEG', quality=quality, optimize=True)
+    return img_buffer
+
+# ==================== VALIDACIÓN TEMPRANA ====================
+
+def validar_imagen_antes_procesar(imagen):
+    """Valida que la imagen sea procesable antes de enviar a Gemini"""
+    # Verificar tamaño mínimo
+    if min(imagen.size) < 100:
+        return False, "Imagen muy pequeña (menos de 100px en alguna dimensión)"
+    
+    # Verificar que tenga contenido (no completamente en blanco/negro)
+    # Convertir a escala de grises para análisis
+    if imagen.mode != 'L':
+        img_gray = imagen.convert('L')
+    else:
+        img_gray = imagen
+    
+    # Calcular desviación estándar de píxeles (imagen en blanco tiene std ~0)
+    pixels = np.array(img_gray)
+    std_dev = np.std(pixels)
+    
+    if std_dev < 5:  # Imagen muy uniforme (probablemente en blanco)
+        return False, "Imagen parece estar en blanco o sin contenido"
+    
+    return True, None
+
+# ==================== CACHÉ DE RESULTADOS ====================
+
+@st.cache_data(ttl=3600)  # Cache por 1 hora
+def extraer_con_gemini_cached(_imagen_hash, imagen_bytes):
+    """Extrae datos con caché basado en hash de imagen"""
+    try:
+        # Reconstruir imagen desde bytes
+        imagen = Image.open(BytesIO(imagen_bytes))
+        return extraer_con_gemini_interno(imagen)
+    except Exception:
+        return None
+
+def obtener_hash_imagen(imagen):
+    """Obtiene hash MD5 de la imagen para usar como clave de caché"""
+    img_buffer = BytesIO()
+    imagen.save(img_buffer, format='JPEG', quality=90)
+    return hashlib.md5(img_buffer.getvalue()).hexdigest()
+
+def extraer_con_gemini_interno(imagen, max_output_tokens=2048, max_reintentos=2):
+    """Función interna de extracción con reintentos inteligentes y rate limiting"""
     if not GEMINI_API_KEY:
-        st.error("Error: GEMINI_API_KEY no configurada")
         return None
     
     try:
@@ -129,77 +235,89 @@ def extraer_con_gemini(imagen):
         if not model:
             return None
         
-        # Convertir imagen optimizada (calidad balanceada)
-        img_buffer = BytesIO()
-        imagen.save(img_buffer, format='JPEG', quality=90, optimize=True)
+        # Optimizar imagen antes de procesar
+        img_buffer = optimizar_imagen_para_gemini(imagen)
         
-        response = model.generate_content(
-            [PROMPT_GEMINI, {'mime_type': 'image/jpeg', 'data': img_buffer.getvalue()}],
-            generation_config=GENERATION_CONFIG
-        )
+        # Tokens progresivos para reintentos
+        tokens_por_reintento = [max_output_tokens, 3072, 4096]
         
-        # Verificar que la respuesta tenga contenido válido
-        if not response.candidates:
-            st.error("Error: No se recibió respuesta de Gemini")
-            return None
-        
-        candidate = response.candidates[0]
-        
-        # Obtener el texto de forma segura - intentar múltiples métodos
+        # Inicializar texto antes del loop
         texto = ""
         
-        # Método 1: Intentar acceder directamente a response.text (más confiable)
-        try:
-            texto = response.text
-        except (AttributeError, ValueError) as e:
-            # Método 2: Acceder a través de candidate.content.parts
-            if hasattr(candidate, 'content') and candidate.content:
-                if hasattr(candidate.content, 'parts'):
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            texto += part.text
-                elif hasattr(candidate.content, 'text'):
-                    texto = candidate.content.text
-        
-        # Verificar finish_reason después de intentar obtener el texto
-        finish_reason = getattr(candidate, 'finish_reason', None)
-        
-        # Si no hay texto pero finish_reason es 2 (MAX_TOKENS), intentar con más tokens
-        if not texto and finish_reason == 2:
-            st.warning("La respuesta fue detenida por límite de tokens. Reintentando con más tokens...")
-            config_extended = GENERATION_CONFIG.copy()
-            config_extended["max_output_tokens"] = 2048
+        for intento in range(max_reintentos + 1):
             try:
+                # Aplicar rate limiting
+                rate_limiter.wait_if_needed()
+                
+                config = GENERATION_CONFIG.copy()
+                config["max_output_tokens"] = tokens_por_reintento[min(intento, len(tokens_por_reintento) - 1)]
+                
                 response = model.generate_content(
                     [PROMPT_GEMINI, {'mime_type': 'image/jpeg', 'data': img_buffer.getvalue()}],
-                    generation_config=config_extended
+                    generation_config=config
                 )
-                if response.candidates:
-                    candidate = response.candidates[0]
-                    try:
-                        texto = response.text
-                    except (AttributeError, ValueError):
-                        if hasattr(candidate, 'content') and candidate.content:
-                            if hasattr(candidate.content, 'parts'):
-                                for part in candidate.content.parts:
-                                    if hasattr(part, 'text') and part.text:
-                                        texto += part.text
-                # Verificar finish_reason actualizado
-                if response.candidates:
-                    finish_reason = getattr(response.candidates[0], 'finish_reason', finish_reason)
+                
+                # Verificar que la respuesta tenga contenido válido
+                if not response.candidates:
+                    if intento == max_reintentos:
+                        return None
+                    continue
+                
+                candidate = response.candidates[0]
+                
+                # Obtener el texto de forma segura - intentar múltiples métodos
+                texto = ""
+                
+                # Método 1: Intentar acceder directamente a response.text (más confiable)
+                try:
+                    texto = response.text
+                except (AttributeError, ValueError):
+                    # Método 2: Acceder a través de candidate.content.parts
+                    if hasattr(candidate, 'content') and candidate.content:
+                        if hasattr(candidate.content, 'parts'):
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    texto += part.text
+                        elif hasattr(candidate.content, 'text'):
+                            texto = candidate.content.text
+                
+                # Verificar finish_reason después de intentar obtener el texto
+                finish_reason = getattr(candidate, 'finish_reason', None)
+                
+                # Si tenemos texto y no es MAX_TOKENS, éxito
+                if texto and finish_reason != 2:
+                    break
+                
+                # Si es MAX_TOKENS y hay más reintentos, continuar con más tokens
+                if finish_reason == 2 and intento < max_reintentos:
+                    continue
+                
+                # Si no hay texto, verificar bloqueos de seguridad
+                if not texto:
+                    if finish_reason == 3:
+                        if intento == max_reintentos:
+                            return None
+                        continue
+                    elif finish_reason == 2:
+                        if intento == max_reintentos:
+                            return None
+                        continue
+                    else:
+                        if intento == max_reintentos:
+                            return None
+                        continue
+                        
             except Exception as e:
-                st.warning(f"No se pudo reintentar: {str(e)}")
+                if intento == max_reintentos:
+                    raise
+                # Backoff exponencial
+                time.sleep(1 * (intento + 1))
+                continue
         
-        # Si aún no tenemos texto, verificar si hay bloqueos de seguridad
+        # Si aún no tenemos texto después de todos los reintentos
         if not texto:
-            if finish_reason == 3:
-                st.error("La respuesta fue bloqueada por filtros de seguridad. Verifica que la imagen no contenga contenido sensible.")
-            elif finish_reason == 2:
-                st.error("Error: La respuesta fue detenida por límite de tokens y no se pudo recuperar.")
-            else:
-                st.error(f"Error: No se pudo extraer texto de la respuesta. Finish reason: {finish_reason}")
             return None
-        
+
         texto = texto.strip()
         texto = re.sub(r'```json\s*|```\s*', '', texto).strip()
         
@@ -278,6 +396,36 @@ def extraer_con_gemini(imagen):
 
 # ==================== EXTRACCIÓN DE DATOS CON GEMINI ====================
 
+def extraer_con_gemini(imagen):
+    """Función pública de extracción con validación, caché y manejo de errores"""
+    if not GEMINI_API_KEY:
+        st.error("Error: GEMINI_API_KEY no configurada")
+        return None
+    
+    # Validación temprana
+    es_valida, mensaje_error = validar_imagen_antes_procesar(imagen)
+    if not es_valida:
+        st.warning(f"Imagen no válida: {mensaje_error}")
+        return None
+    
+    # Intentar usar caché
+    try:
+        imagen_hash = obtener_hash_imagen(imagen)
+        img_buffer = BytesIO()
+        imagen.save(img_buffer, format='JPEG', quality=90)
+        imagen_bytes = img_buffer.getvalue()
+        
+        # Intentar obtener del caché
+        datos = extraer_con_gemini_cached(imagen_hash, imagen_bytes)
+        if datos:
+            return datos
+    except Exception:
+        # Si falla el caché, continuar con extracción normal
+        pass
+    
+    # Extracción directa si no hay caché
+    return extraer_con_gemini_interno(imagen)
+
 def extraer_datos_factura(imagen):
     """
     Extrae datos de factura usando exclusivamente Gemini AI
@@ -294,8 +442,8 @@ def extraer_datos_factura(imagen):
 
 # ==================== PROCESAMIENTO DE PDF ====================
 
-def procesar_pdf(pdf_bytes):
-    """Procesa un PDF y extrae datos de facturas"""
+def procesar_pdf(pdf_bytes, max_workers=4):
+    """Procesa un PDF y extrae datos de facturas con procesamiento paralelo"""
     try:
         with st.spinner("Convirtiendo PDF a imágenes..."):
             kwargs = {'dpi': 200}  # DPI reducido para mayor velocidad
@@ -311,47 +459,308 @@ def procesar_pdf(pdf_bytes):
             st.warning("Poppler no está instalado.")
         return [], {}
     
-    resultados = []
-    estadisticas = {"gemini": 0, "total": len(imagenes)}
-    progress_bar = st.progress(0)
-    
+    # Validar todas las imágenes antes de procesar
+    imagenes_validas = []
     for i, imagen in enumerate(imagenes):
-        st.divider()
-        st.markdown(f"### Factura {i+1} de {len(imagenes)}")
-        
-        col1, col2 = st.columns([1, 2])
-        
-        with col1:
-            st.image(imagen, caption=f"Página {i+1}", use_container_width=True)
-        
-        with col2:
-            datos, metodo = extraer_datos_factura(imagen)
-            estadisticas[metodo.lower()] += 1
+        es_valida, mensaje = validar_imagen_antes_procesar(imagen)
+        if not es_valida:
+            st.warning(f"Página {i+1} saltada: {mensaje}")
+        else:
+            imagenes_validas.append((i, imagen))
+    
+    if not imagenes_validas:
+        st.error("No hay imágenes válidas para procesar")
+        return [], {"gemini": 0, "total": len(imagenes)}
+    
+    # Procesar con visualización en tiempo real
+    resultados_dict = {}
+    estadisticas = {"gemini": 0, "total": len(imagenes)}
+    
+    # Función auxiliar para convertir imagen a base64
+    def imagen_to_base64(imagen):
+        """Convierte una imagen PIL a base64 para mostrar en HTML"""
+        buffered = BytesIO()
+        imagen.save(buffered, format="PNG", quality=85)
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return img_str
+    
+    # Contenedor para mostrar progreso con diseño moderno
+    st.markdown("""
+    <div style="margin-bottom: 2rem;">
+        <h3 style="color: var(--brand-300); font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem;">⚡ Procesamiento en Curso</h3>
+        <p style="color: var(--gray-300); font-size: 0.95rem; margin: 0;">Análisis inteligente en tiempo real con IA</p>
+    </div>
+    <style>
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+    }
+    @keyframes shimmer {
+        0% { background-position: -1000px 0; }
+        100% { background-position: 1000px 0; }
+    }
+    .processing-card {
+        background: var(--glass-bg);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-md);
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+        transition: all 0.3s ease;
+        position: relative;
+        overflow: hidden;
+    }
+    .processing-card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(20, 184, 166, 0.1), transparent);
+        animation: shimmer 2s infinite;
+    }
+    .processing-card.processing {
+        border-color: var(--brand-300);
+        box-shadow: 0 0 20px rgba(20, 184, 166, 0.2);
+    }
+    .processing-card.completed {
+        border-color: var(--brand-400);
+        box-shadow: 0 0 15px rgba(20, 184, 166, 0.15);
+    }
+    .processing-card.error {
+        border-color: #EF4444;
+        box-shadow: 0 0 15px rgba(239, 68, 68, 0.15);
+    }
+    .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 1rem;
+        border-radius: 20px;
+        font-size: 0.875rem;
+        font-weight: 600;
+        backdrop-filter: blur(10px);
+    }
+    .status-processing {
+        background: rgba(20, 184, 166, 0.15);
+        color: var(--brand-300);
+        border: 1px solid rgba(20, 184, 166, 0.3);
+    }
+    .status-completed {
+        background: rgba(20, 184, 166, 0.2);
+        color: var(--brand-400);
+        border: 1px solid rgba(20, 184, 166, 0.4);
+    }
+    .status-error {
+        background: rgba(239, 68, 68, 0.15);
+        color: #EF4444;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .spinner {
+        width: 18px;
+        height: 18px;
+        border: 2px solid var(--brand-300);
+        border-top: 2px solid transparent;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    progress_container = st.container()
+    
+    # Procesar cada imagen con visualización en tiempo real
+    for idx, (i, imagen) in enumerate(imagenes_validas):
+        with progress_container:
+            # Placeholder para el card completo
+            card_placeholder = st.empty()
             
-            if datos:
-                datos["pagina"] = i + 1
-                datos["metodo_extraccion"] = metodo
-                resultados.append(datos)
+            # Estado inicial: Procesando
+            img_base64 = imagen_to_base64(imagen)
+            with card_placeholder.container():
+                st.markdown(f"""
+                <div class="processing-card processing" id="card-{i}">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                        <div>
+                            <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                            <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Análisis con IA en progreso...</p>
+                        </div>
+                        <div class="status-badge status-processing">
+                            <div class="spinner"></div>
+                            <span>Procesando</span>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 200px 1fr; gap: 1.5rem; align-items: start;">
+                        <div style="border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--glass-border);">
+                            <img src="data:image/png;base64,{img_base64}" style="width: 100%; height: auto; display: block;" alt="Página {i+1}">
+                        </div>
+                        <div>
+                            <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 1rem; margin-bottom: 1rem;">
+                                <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem;">
+                                    <span style="animation: pulse 2s infinite;">⏳</span>
+                                    <span>Extrayendo datos estructurados con Gemini AI...</span>
+                                </p>
+                            </div>
+                            <div style="background: linear-gradient(90deg, var(--brand-300) 0%, var(--brand-300) 0%, rgba(20, 184, 166, 0.1) 0%); border-radius: 8px; height: 6px; margin-bottom: 0.5rem; transition: all 0.3s ease;" id="progress-bar-{i}"></div>
+                            <p style="color: var(--gray-400); margin: 0; font-size: 0.75rem; text-align: right;" id="progress-text-{i}">Iniciando análisis...</p>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Simular progreso mientras procesa
+            progress_individual = st.progress(0)
+            for progress_val in [0.2, 0.4, 0.6, 0.8]:
+                progress_individual.progress(progress_val)
+                time.sleep(0.15)
+            
+            # Procesar la imagen
+            try:
+                datos = extraer_con_gemini(imagen)
+                progress_individual.progress(1.0)
                 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.metric("Contrato", datos.get("numero_contrato") or "N/A")
-                    st.metric("Total", f"${datos.get('total_pagar', 0):,.0f}")
-                    if datos.get("empresa"):
-                        st.metric("Empresa", datos.get("empresa"))
-                
-                with col_b:
-                    ref = datos.get("codigo_referencia") or "N/A"
-                    st.metric("Referencia", ref[:20] + "..." if len(ref) > 20 and ref != "N/A" else ref)
-                    dir_val = datos.get("direccion") or "N/A"
-                    st.metric("Dirección", dir_val[:25] + "..." if len(dir_val) > 25 and dir_val != "N/A" else dir_val)
-                    if datos.get("periodo_facturado"):
-                        st.metric("Periodo", datos.get("periodo_facturado"))
-                
-                with st.expander("Ver todos los datos", expanded=False):
-                    st.json(datos)
+                if datos:
+                    datos["pagina"] = i + 1
+                    datos["metodo_extraccion"] = "Gemini"
+                    resultados_dict[i] = datos
+                    estadisticas["gemini"] += 1
+                    
+                    # Actualizar card con datos extraídos
+                    with card_placeholder.container():
+                        st.markdown(f"""
+                        <div class="processing-card completed" id="card-{i}">
+                            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                                <div>
+                                    <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                                    <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Datos extraídos exitosamente</p>
+                                </div>
+                                <div class="status-badge status-completed">
+                                    <span style="color: var(--brand-400);">✓</span>
+                                    <span>Completado</span>
+                                </div>
+                            </div>
+                            <div style="display: grid; grid-template-columns: 200px 1fr; gap: 1.5rem; align-items: start;">
+                                <div style="border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--glass-border);">
+                                    <img src="data:image/png;base64,{img_base64}" style="width: 100%; height: auto; display: block;" alt="Página {i+1}">
+                                </div>
+                                <div>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Contrato</strong></p>
+                                            <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">{datos.get("numero_contrato") or "N/A"}</p>
+                                        </div>
+                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Total</strong></p>
+                                            <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">${datos.get('total_pagar', 0):,.0f}</p>
+                                        </div>
+                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Referencia</strong></p>
+                                            <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("codigo_referencia") or "N/A")[:20]}</p>
+                                        </div>
+                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Empresa</strong></p>
+                                            <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("empresa") or "N/A")[:25]}</p>
+                                        </div>
+                                    </div>
+                                    <div style="background: rgba(20, 184, 166, 0.1); border: 1px solid rgba(20, 184, 166, 0.3); border-radius: var(--radius-sm); padding: 0.75rem; text-align: center;">
+                                        <p style="color: var(--brand-400); margin: 0; font-size: 0.875rem; font-weight: 600;">✓ Datos extraídos exitosamente</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                else:
+                    # Error en extracción
+                    with card_placeholder.container():
+                        st.markdown(f"""
+                        <div class="processing-card error" id="card-{i}">
+                            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                                <div>
+                                    <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                                    <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Error en la extracción</p>
+                                </div>
+                                <div class="status-badge status-error">
+                                    <span>✗</span>
+                                    <span>Error</span>
+                                </div>
+                            </div>
+                            <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 1rem;">
+                                <p style="color: #EF4444; margin: 0; font-size: 0.875rem;">⚠️ No se pudieron extraer datos de esta página</p>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+            except Exception as e:
+                # Error en procesamiento
+                progress_individual.progress(1.0)
+                with card_placeholder.container():
+                    st.markdown(f"""
+                    <div class="processing-card error" id="card-{i}">
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                            <div>
+                                <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                                <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Error en el procesamiento</p>
+                            </div>
+                            <div class="status-badge status-error">
+                                <span>✗</span>
+                                <span>Error</span>
+                            </div>
+                        </div>
+                        <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 1rem;">
+                            <p style="color: #EF4444; margin: 0; font-size: 0.875rem;">❌ Error: {str(e)[:100]}</p>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+    
+    # Ordenar resultados por índice de página
+    resultados = [resultados_dict[i] for i in sorted(resultados_dict.keys())]
+    
+    # Mostrar resumen en formato lista
+    if resultados:
+        st.divider()
+        st.markdown("### 📊 Resumen de Facturas Procesadas")
         
-        progress_bar.progress((i + 1) / len(imagenes))
+        # Lista compacta de resultados
+        for resultado in resultados:
+            pagina = resultado["pagina"]
+            
+            # Card de lista compacta
+            with st.container():
+                st.markdown(f"""
+                <div style="background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: var(--radius-md); padding: 1.25rem; margin-bottom: 1rem; transition: all 0.2s ease;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+                        <h4 style="color: var(--brand-300); margin: 0; font-size: 1.1rem;">📄 Página {pagina}</h4>
+                        <span style="color: var(--brand-400); font-size: 0.875rem; font-weight: 600;">✓ Procesada</span>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+                        <div>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Contrato:</strong> {resultado.get("numero_contrato") or "N/A"}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Total:</strong> <span style="color: var(--brand-300); font-weight: 600;">${resultado.get('total_pagar', 0):,.0f}</span></p>
+                        </div>
+                        <div>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Empresa:</strong> {resultado.get("empresa") or "N/A"}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Referencia:</strong> {(resultado.get("codigo_referencia") or "N/A")[:25]}</p>
+                        </div>
+                        <div>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Período:</strong> {resultado.get("periodo_facturado") or "N/A"}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Vencimiento:</strong> {resultado.get("fecha_vencimiento") or "N/A"}</p>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Expander para ver detalles completos
+                with st.expander(f"🔍 Ver detalles completos - Página {pagina}", expanded=False):
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        st.image(imagenes[pagina - 1], caption=f"Página {pagina}", use_container_width=True)
+                    with col2:
+                        st.json(resultado)
     
     return resultados, estadisticas
 
