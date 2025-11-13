@@ -10,7 +10,6 @@ import os
 import platform
 import subprocess
 from dotenv import load_dotenv
-import concurrent.futures
 import time
 import hashlib
 from collections import deque
@@ -19,19 +18,50 @@ import numpy as np
 import base64
 import gc
 import textwrap
+import logging
+import html
+from PyPDF2 import PdfReader
+
+# Configurar logging estructurado
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('documarval.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# Constantes de configuración
+MAX_PDF_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_PAGES = 200
 
 # ==================== FUNCIÓN HELPER PARA SECRETS ====================
 
 def get_secret(key, default=None):
     """Obtiene un secreto de forma segura, manejando cuando no existe secrets.toml"""
     try:
+        # Verificar primero si st.secrets existe como atributo
+        if not hasattr(st, 'secrets'):
+            logger.debug(f"st.secrets no disponible, usando default para {key}")
+            return default
         # Intentar acceder a st.secrets - puede lanzar StreamlitSecretNotFoundError
         # si no existe el archivo secrets.toml
-        return st.secrets.get(key, default)
-    except (StreamlitSecretNotFoundError, AttributeError, KeyError, FileNotFoundError, Exception):
+        value = st.secrets.get(key, default)
+        # Nunca loggear valores de secrets, solo confirmar si está configurado
+        if value and key.upper().endswith('_KEY'):
+            logger.debug(f"Secret {key} configurado (longitud: {len(value)})")
+        return value
+    except (StreamlitSecretNotFoundError, AttributeError, KeyError, FileNotFoundError) as e:
         # Si no existe secrets.toml o hay cualquier error, retornar el valor por defecto
+        logger.debug(f"Error obteniendo secret {key}: {type(e).__name__}")
+        return default
+    except Exception as e:
+        # Loggear errores inesperados pero no exponer información sensible
+        logger.error(f"Error inesperado obteniendo secret {key}: {type(e).__name__}")
         return default
 
 # ==================== DETECCIÓN AUTOMÁTICA DE DEPENDENCIAS ====================
@@ -83,10 +113,48 @@ if GEMINI_API_KEY:
 # Cachear el modelo de Gemini para mejor rendimiento
 @st.cache_resource
 def get_gemini_model():
-    """Obtiene el modelo de Gemini (cacheado)"""
+    """Obtiene el modelo de Gemini (cacheado) con manejo de errores mejorado"""
     if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY no configurada")
+        st.error("GEMINI_API_KEY no está configurada. Por favor configura tu API key en el archivo .env")
         return None
-    return genai.GenerativeModel(GEMINI_MODEL)
+    
+    # Lista de modelos a probar en orden de preferencia
+    modelos_a_probar = [
+        GEMINI_MODEL,  # El modelo configurado
+        "gemini-1.5-flash",  # Modelo rápido y estable (fallback)
+        "gemini-1.5-pro",  # Modelo más potente (fallback)
+        "gemini-pro",  # Modelo legacy pero estable (fallback)
+    ]
+    
+    for modelo_nombre in modelos_a_probar:
+        try:
+            modelo = genai.GenerativeModel(modelo_nombre)
+            if modelo_nombre != GEMINI_MODEL:
+                logger.info(f"Usando modelo fallback: {modelo_nombre} (configurado: {GEMINI_MODEL})")
+                st.info(f"Usando modelo: {modelo_nombre} (el modelo configurado {GEMINI_MODEL} no está disponible)")
+            else:
+                logger.info(f"Modelo {GEMINI_MODEL} cargado exitosamente")
+            return modelo
+        except Exception as e:
+            error_msg = str(e).lower()
+            error_type = type(e).__name__
+            # Si es un error de modelo no encontrado, continuar con el siguiente
+            if "not found" in error_msg or "404" in error_msg or "model" in error_msg:
+                logger.debug(f"Modelo {modelo_nombre} no disponible: {error_type}")
+                continue
+            # Si es otro tipo de error (API key, etc.), mostrar y detener
+            else:
+                logger.error(f"Error al cargar modelo {modelo_nombre}: {error_type}")
+                st.error(f"Error al cargar modelo {modelo_nombre}: {error_type}")
+                if "api" in error_msg or "key" in error_msg or "401" in error_msg or "403" in error_msg:
+                    logger.error("Error de autenticación con API key")
+                    return None
+    
+    # Si ningún modelo funcionó
+    logger.error("No se pudo cargar ningún modelo de Gemini")
+    st.error("No se pudo cargar ningún modelo de Gemini. Verifica tu API key y la disponibilidad de los modelos.")
+    return None
 
 # Prompt optimizado (constante)
 PROMPT_GEMINI = """Analiza ÚNICAMENTE esta factura de servicios públicos colombiana (agua, luz, gas, internet, telefonía) y extrae SOLO los datos financieros y de identificación relevantes.
@@ -166,6 +234,14 @@ class RateLimiter:
 
 # Instancia global del rate limiter
 rate_limiter = RateLimiter(max_calls=10, time_window=60)
+
+# ==================== UTILIDADES DE SEGURIDAD ====================
+
+def sanitize_html(text):
+    """Sanitiza texto para uso seguro en HTML, previniendo XSS"""
+    if not isinstance(text, str):
+        text = str(text)
+    return html.escape(text)
 
 # ==================== OPTIMIZACIÓN DE IMÁGENES ====================
 
@@ -319,10 +395,28 @@ def extraer_con_gemini_interno(imagen, max_output_tokens=2048, max_reintentos=2)
                         continue
                         
             except Exception as e:
-                if intento == max_reintentos:
-                    raise
-                # Backoff exponencial
-                time.sleep(1 * (intento + 1))
+                error_type = type(e).__name__
+                error_msg = str(e).lower()
+                logger.error(f"Error en intento {intento + 1}/{max_reintentos + 1}: {error_type}: {error_msg[:200]}")
+                
+                # Clasificar errores para mejor manejo
+                if "rate limit" in error_msg or "429" in error_msg:
+                    if intento == max_reintentos:
+                        logger.warning("Límite de tasa excedido después de todos los reintentos")
+                        st.warning("Límite de tasa excedido. Intenta más tarde.")
+                        return None
+                    sleep_time = 2 * (intento + 1)  # Backoff más largo para rate limits
+                    logger.info(f"Rate limit detectado, esperando {sleep_time}s")
+                    time.sleep(sleep_time)
+                elif intento == max_reintentos:
+                    logger.error(f"Error final después de {max_reintentos + 1} intentos: {error_type}")
+                    st.error(f"Error al procesar: {error_type}")
+                    return None
+                else:
+                    # Backoff exponencial estándar
+                    sleep_time = 1 * (intento + 1)
+                    logger.debug(f"Reintentando en {sleep_time}s (intento {intento + 1}/{max_reintentos + 1})")
+                    time.sleep(sleep_time)
                 continue
         
         # Si aún no tenemos texto después de todos los reintentos
@@ -397,12 +491,23 @@ def extraer_con_gemini_interno(imagen, max_output_tokens=2048, max_reintentos=2)
         return datos
         
     except json.JSONDecodeError as e:
-        st.error(f"Error al parsear JSON: {str(e)}")
-        if 'texto' in locals():
+        logger.error(f"Error al parsear JSON: {str(e)}")
+        if 'texto' in locals() and texto:
+            logger.debug(f"Texto recibido (primeros 500 chars): {texto[:500]}")
+            st.error(f"Error al parsear respuesta JSON: {str(e)[:100]}")
             st.info(f"Respuesta recibida: {texto[:500]}...")
+        else:
+            st.error("Error al parsear respuesta JSON: No se recibió texto válido")
+        return None
+    except ValueError as e:
+        logger.error(f"Error de validación: {str(e)}")
+        st.error(f"Error de validación: {str(e)[:100]}")
         return None
     except Exception as e:
-        st.error(f"Error con Gemini: {str(e)}")
+        error_type = type(e).__name__
+        error_msg = str(e)
+        logger.error(f"Error inesperado con Gemini: {error_type}: {error_msg[:200]}")
+        st.error(f"Error con Gemini: {error_type}")
         return None
 
 # ==================== EXTRACCIÓN DE DATOS CON GEMINI ====================
@@ -709,7 +814,7 @@ def procesar_pdf(pdf_bytes, max_workers=4, batch_size=20):
                                             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
                                                 <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
                                                     <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Contrato</strong></p>
-                                                    <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">{datos.get("numero_contrato") or "N/A"}</p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">{sanitize_html(datos.get("numero_contrato") or "N/A")}</p>
                                                 </div>
                                                 <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
                                                     <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Total</strong></p>
@@ -717,11 +822,11 @@ def procesar_pdf(pdf_bytes, max_workers=4, batch_size=20):
                                                 </div>
                                                 <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
                                                     <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Referencia</strong></p>
-                                                    <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("codigo_referencia") or "N/A")[:20]}</p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{sanitize_html((datos.get("codigo_referencia") or "N/A")[:20])}</p>
                                                 </div>
                                                 <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
                                                     <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Empresa</strong></p>
-                                                    <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("empresa") or "N/A")[:25]}</p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{sanitize_html((datos.get("empresa") or "N/A")[:25])}</p>
                                                 </div>
                                             </div>
                                             <div style="background: rgba(20, 184, 166, 0.1); border: 1px solid rgba(20, 184, 166, 0.3); border-radius: var(--radius-sm); padding: 0.75rem; text-align: center;">
@@ -813,16 +918,16 @@ def procesar_pdf(pdf_bytes, max_workers=4, batch_size=20):
                     </div>
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
                         <div>
-                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Contrato:</strong> {resultado.get("numero_contrato") or "N/A"}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Contrato:</strong> {sanitize_html(resultado.get("numero_contrato") or "N/A")}</p>
                             <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Total:</strong> <span style="color: var(--brand-300); font-weight: 600;">${resultado.get('total_pagar', 0):,.0f}</span></p>
                         </div>
                         <div>
-                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Empresa:</strong> {resultado.get("empresa") or "N/A"}</p>
-                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Referencia:</strong> {(resultado.get("codigo_referencia") or "N/A")[:25]}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Empresa:</strong> {sanitize_html(resultado.get("empresa") or "N/A")}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Referencia:</strong> {sanitize_html((resultado.get("codigo_referencia") or "N/A")[:25])}</p>
                         </div>
                         <div>
-                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Período:</strong> {resultado.get("periodo_facturado") or "N/A"}</p>
-                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Vencimiento:</strong> {resultado.get("fecha_vencimiento") or "N/A"}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Período:</strong> {sanitize_html(resultado.get("periodo_facturado") or "N/A")}</p>
+                            <p style="color: var(--gray-300); margin: 0.25rem 0; font-size: 0.875rem;"><strong style="color: var(--white);">Vencimiento:</strong> {sanitize_html(resultado.get("fecha_vencimiento") or "N/A")}</p>
                         </div>
                     </div>
                 </div>
@@ -1550,6 +1655,24 @@ GEMINI_MODEL=gemini-2.5-flash
             """, unsafe_allow_html=True)
             return
         
+        # Validar tamaño del archivo
+        uploaded_file.seek(0, 2)  # Ir al final del archivo
+        file_size = uploaded_file.tell()
+        uploaded_file.seek(0)  # Volver al inicio
+        
+        if file_size > MAX_PDF_SIZE:
+            size_mb = file_size / (1024 * 1024)
+            max_mb = MAX_PDF_SIZE / (1024 * 1024)
+            logger.warning(f"Archivo demasiado grande: {size_mb:.1f} MB (máximo: {max_mb} MB)")
+            st.error(f"El archivo es demasiado grande ({size_mb:.1f} MB). Máximo permitido: {max_mb} MB")
+            return
+        
+        # Validar tipo MIME
+        if uploaded_file.type != 'application/pdf':
+            logger.warning(f"Tipo de archivo inválido: {uploaded_file.type}")
+            st.error("El archivo debe ser un PDF válido")
+            return
+        
         if st.button("Procesar Facturas", type="primary", use_container_width=True):
             
             if not GEMINI_API_KEY:
@@ -1564,6 +1687,26 @@ GEMINI_MODEL=gemini-2.5-flash
                 return
             
             pdf_bytes = uploaded_file.read()
+            
+            # Validar que sea un PDF válido (magic bytes)
+            if not pdf_bytes.startswith(b'%PDF'):
+                logger.error("Archivo no es un PDF válido (magic bytes incorrectos)")
+                st.error("El archivo no es un PDF válido")
+                return
+            
+            # Validar número de páginas
+            try:
+                reader = PdfReader(BytesIO(pdf_bytes))
+                num_pages = len(reader.pages)
+                logger.info(f"PDF validado: {num_pages} páginas, {file_size / 1024:.1f} KB")
+                
+                if num_pages > MAX_PAGES:
+                    logger.warning(f"PDF tiene demasiadas páginas: {num_pages} (máximo: {MAX_PAGES})")
+                    st.error(f"El PDF tiene demasiadas páginas ({num_pages}). Máximo permitido: {MAX_PAGES}")
+                    return
+            except Exception as e:
+                logger.error(f"Error validando PDF: {type(e).__name__}: {str(e)[:200]}")
+                st.warning("No se pudo validar el número de páginas, continuando con el procesamiento...")
             # Ajustar batch_size según el tamaño del PDF para optimizar memoria
             # PDFs grandes: lotes más pequeños, PDFs pequeños: lotes más grandes
             # Para 200 páginas, usar batch_size=15 para mejor gestión de memoria
@@ -1643,7 +1786,7 @@ GEMINI_MODEL=gemini-2.5-flash
                 st.download_button(
                     label="Descargar Excel",
                     data=excel_data,
-                    file_name=f"facturas_{uploaded_file.name.replace('.pdf', '')}.xlsx",
+                    file_name=f"facturas_{sanitize_html(uploaded_file.name.replace('.pdf', ''))}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )

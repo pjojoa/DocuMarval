@@ -33,3 +33,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Poppler binaries (too large for repo)
+poppler-*/
+poppler.zip
+*.zip

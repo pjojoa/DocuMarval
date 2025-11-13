@@ -1,0 +1,2 @@
+"""Configuración centralizada de DocuMarval"""
+
