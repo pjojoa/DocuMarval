@@ -1,9 +1,8 @@
-streamlit==1.31.0
+﻿streamlit==1.31.0
 google-generativeai==0.3.2
-pytesseract==0.3.10
 pdf2image==1.16.3
-Pillow==10.2.0
+Pillow>=10.3.0
 pandas==2.2.0
 openpyxl==3.1.2
-opencv-python-headless==4.9.0.80
-dotenv
+python-dotenv==1.0.0
+numpy>=1.24.0,<2.0.0
