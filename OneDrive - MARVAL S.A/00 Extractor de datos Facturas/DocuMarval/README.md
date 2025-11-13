@@ -13,13 +13,11 @@ Sistema inteligente que extrae datos de facturas en PDF usando Google Gemini AI.
 
 ### Requisitos
 - Python 3.12.10
-- Ultima version de Tesseract descargado e instalado en el equipo. (https://github.com/UB-Mannheim/tesseract/wiki)
-- Ultima version de Poppler descargada e instalada en el equipo. (https://github.com/oschwartz10612/poppler-windows/releases)
-- Archivo `.env` en la raíz del proyecto, debe contener la siguiente información (reemplazae "..." con los datos correspondientes):
+- Última versión de Poppler descargada e instalada en el equipo. (https://github.com/oschwartz10612/poppler-windows/releases)
+- Archivo `.env` en la raíz del proyecto, debe contener la siguiente información (reemplaza "..." con los datos correspondientes):
 ```markdown
 GEMINI_API_KEY="..."
 GEMINI_MODEL="..."
-TESSERACT_PATH="..."
 POPPLER_PATH="..."
 ```
 
@@ -53,37 +51,28 @@ python -m venv venv
 venv\Scripts\activate
 ```
 
-#### 3. Instalar Tesseract OCR
-Accede al repositorio de Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
-
-Descarga el instalador, ejecutalo y sigue las instrucciones.
-
-#### 4. Instalar Poppler
+#### 3. Instalar Poppler
 Accede al repositorio de Poppler: https://github.com/oschwartz10612/poppler-windows/
 
 Descarga el ultimo Zip, descomprime el archivo en la ubicacion de tu preferencia
 
-#### 5. Configurar variables de entorno
-Añade Tesseract OCR y Poppler al PATH del sistema.
-
-#### 6. Configurar las variables de entorno
+#### 4. Configurar las variables de entorno
 Entra o crea un archivo ´.env´ en la raíz del proyecto. Añade las siguientes variables:
 
 ```markdown
 GEMINI_API_KEY="..."
 GEMINI_MODEL="..."
-TESSERACT_PATH="..."
 POPPLER_PATH="..."
 ```
 
 Y reemplaza los puntos suspensivos con los datos correspondientes.
 
-#### 7. Instalar dependencias Python
+#### 5. Instalar dependencias Python
 ```bash
 pip install -r requirements.txt
 ```
 
-#### 8. Ejecutar la aplicación
+#### 6. Ejecutar la aplicación
    ```powershell
    streamlit run lectorFacturas.py
    ```
