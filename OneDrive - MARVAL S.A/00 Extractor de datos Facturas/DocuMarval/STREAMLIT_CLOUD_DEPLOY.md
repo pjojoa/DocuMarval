@@ -20,9 +20,9 @@ Esta guía te ayudará a desplegar DocuMarval en Streamlit Cloud (gratis y ofici
 ### Paso 1: Verificar que tu código esté en GitHub
 
 Asegúrate de que todos los archivos estén en tu repositorio:
-- ✅ `lectorFacturas.py` (archivo principal)
+- ✅ `app.py` (archivo principal)
 - ✅ `requirements.txt`
-- ✅ `.streamlit/config.toml`
+- ✅ `config/`, `services/`, `ui/`, `utils/` (estructura modular)
 - ✅ `Logo.svg` y `Logo_DocuMarval.svg` (si los usas)
 
 ### Paso 2: Acceder a Streamlit Cloud
@@ -41,8 +41,8 @@ Asegúrate de que todos los archivos estén en tu repositorio:
 
 #### Configuración Básica:
 - **App name**: `documarval` (o el nombre que prefieras)
-- **Main file path**: `lectorFacturas.py`
-- **Python version**: Streamlit Cloud usa automáticamente la versión compatible
+- **Main file path**: `app.py` ⚠️ **IMPORTANTE**: Usa `app.py` como archivo principal
+- **Python version**: Streamlit Cloud usa automáticamente la versión compatible (Python 3.11+)
 
 #### Configuración Avanzada (opcional):
 - **App URL**: Se generará automáticamente como `documarval.streamlit.app`
@@ -63,12 +63,21 @@ POPPLER_PATH = "/usr/bin"
 ```
 
 **Formato del archivo secrets.toml en Streamlit Cloud:**
+
+En Streamlit Cloud, ve a **"Secrets"** en la configuración de tu app y pega esto:
+
 ```toml
-[secrets]
-GEMINI_API_KEY = "AIzaSyBYHAkqVS5YkOf2BeiWqwL3oL9YqZxyRlw"
+GEMINI_API_KEY = "tu-clave-de-api-aqui"
 GEMINI_MODEL = "gemini-2.5-flash"
+```
+
+**Nota sobre POPPLER_PATH**: En Streamlit Cloud, Poppler está preinstalado y generalmente se encuentra en `/usr/bin`. El código detecta automáticamente Poppler, así que **NO necesitas configurar POPPLER_PATH** a menos que tengas problemas. Si es necesario, puedes agregarlo:
+
+```toml
 POPPLER_PATH = "/usr/bin"
 ```
+
+Pero normalmente no es necesario.
 
 ### Paso 6: Desplegar
 

@@ -50,6 +50,8 @@ class AppConfig:
         
         poppler_disponible, poppler_path = detectar_poppler()
         
+        # Prioridad: secrets de Streamlit Cloud > variables de entorno > defaults
+        # Esto permite que funcione tanto local (.env) como en Streamlit Cloud (secrets)
         return cls(
             gemini_api_key=os.getenv('GEMINI_API_KEY') or get_secret("GEMINI_API_KEY"),
             gemini_model=os.getenv('GEMINI_MODEL') or get_secret("GEMINI_MODEL", "gemini-1.5-flash"),

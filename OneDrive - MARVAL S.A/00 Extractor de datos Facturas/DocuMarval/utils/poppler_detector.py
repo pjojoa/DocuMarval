@@ -39,19 +39,26 @@ def detectar_poppler():
                 logger.info(f"Poppler encontrado en: {ruta}")
                 return True, ruta
     
-    # Detección para Linux
-    rutas_linux = ['/usr/bin', '/usr/local/bin']
-    for ruta in rutas_linux:
-        if os.path.exists(os.path.join(ruta, 'pdftoppm')):
-            logger.info(f"Poppler encontrado en: {ruta}")
-            return True, ruta
+    # Detección para Linux (incluye Streamlit Cloud)
+    if platform.system() == 'Linux' or os.path.exists('/usr/bin'):
+        rutas_linux = ['/usr/bin', '/usr/local/bin', '/bin']
+        for ruta in rutas_linux:
+            pdftoppm_path = os.path.join(ruta, 'pdftoppm')
+            if os.path.exists(pdftoppm_path):
+                logger.info(f"Poppler encontrado en: {ruta}")
+                return True, ruta
     
-    # Intentar ejecutar pdftoppm directamente
+    # Intentar ejecutar pdftoppm directamente (útil en Streamlit Cloud)
     try:
-        subprocess.run(['pdftoppm', '-v'], capture_output=True, timeout=2, check=False)
-        logger.info("Poppler disponible en PATH")
-        return True, None
-    except:
-        logger.warning("Poppler no encontrado")
-        return False, None
+        result = subprocess.run(['pdftoppm', '-v'], capture_output=True, timeout=2, check=False)
+        if result.returncode == 0 or result.returncode == 1:  # -v puede retornar código 1 pero significa que existe
+            logger.info("Poppler disponible en PATH")
+            return True, None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    except Exception as e:
+        logger.debug(f"Error al verificar pdftoppm en PATH: {e}")
+    
+    logger.warning("Poppler no encontrado")
+    return False, None
 

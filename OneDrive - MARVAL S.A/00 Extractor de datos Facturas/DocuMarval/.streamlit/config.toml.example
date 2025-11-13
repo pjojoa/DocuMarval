@@ -1,0 +1,20 @@
+# Configuración de ejemplo para Streamlit
+# Este archivo NO se usa directamente, es solo una referencia
+# En Streamlit Cloud, configura los secrets desde el dashboard web
+
+[theme]
+primaryColor = "#2F7DEB"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#13223A"
+textColor = "#FFFFFF"
+font = "sans serif"
+
+[server]
+headless = true
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
+
+# NOTA: Los secrets (GEMINI_API_KEY, etc.) se configuran en Streamlit Cloud
+# desde el dashboard, no desde este archivo.
+

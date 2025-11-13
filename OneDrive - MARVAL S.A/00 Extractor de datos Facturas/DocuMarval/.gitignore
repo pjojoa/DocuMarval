@@ -11,6 +11,9 @@ ENV/
 
 # Streamlit
 .streamlit/secrets.toml
+.streamlit/config.toml
+# Pero permitir el ejemplo
+!.streamlit/config.toml.example
 
 # Environment variables
 .env
