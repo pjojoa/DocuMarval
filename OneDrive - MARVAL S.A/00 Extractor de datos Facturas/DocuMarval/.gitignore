@@ -1,7 +1,3 @@
-# Secrets
-.streamlit/secrets.toml
-.env
-
 # Python
 __pycache__/
 *.py[cod]
@@ -10,18 +6,30 @@ __pycache__/
 .Python
 env/
 venv/
+ENV/
 .venv
 
-# IDEs
+# Streamlit
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+.env.local
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Archivos de prueba
-test_*.pdf
-*.xlsx
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

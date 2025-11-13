@@ -1,12 +1,13 @@
-# 📄 Extractor Híbrido de Facturas
+# 📄 DocuMarval - Extractor Inteligente de Facturas
 
-Sistema inteligente que extrae datos de facturas en PDF usando Tesseract OCR y Gemini AI.
+Sistema inteligente que extrae datos de facturas en PDF usando Google Gemini AI.
 
 ## 🚀 Características
 
-- **Adaptativo**: Detecta automáticamente qué herramientas están disponibles
-- **Híbrido**: Usa Tesseract primero (gratis) y Gemini como fallback
-- **Multi-plataforma**: Funciona en Windows, Linux, Mac y en la nube
+- **IA Avanzada**: Usa Google Gemini para extracción precisa de datos
+- **Procesamiento Paralelo**: Procesa múltiples páginas simultáneamente
+- **Optimizado**: Caché, rate limiting y validación temprana
+- **Multi-plataforma**: Funciona en Windows, Linux, Mac y Streamlit Cloud
 
 ## 🛠️ Instalación Local (Windows)
 
@@ -87,8 +88,12 @@ pip install -r requirements.txt
    streamlit run lectorFacturas.py
    ```
 
+## 🌐 Despliegue en Streamlit Cloud
+
+Para desplegar la aplicación en Streamlit Cloud, consulta la guía completa en `STREAMLIT_CLOUD_DEPLOY.md`.
+
 ## Notas
 - Si el entorno virtual fue movido de carpeta, se recomienda eliminarlo y crearlo nuevamente.
 - Todas las dependencias necesarias están en el archivo `requirements.txt`.
-- En de que Tesseract falle o presente resultados insatisfactorios se utiliza Gemini AI como respaldo, por lo que se recomienda que el PDF y las facturas en el tengan la mejor calidad posible.
-- La solución actualmente lee a detalle cada factura entregada en el PDF, por ello, el tiempo de ejecución es directamente proporcional a la cantidad de facturas adjuntas en el PDF.
+- La aplicación usa Google Gemini AI para la extracción de datos, por lo que se recomienda que el PDF y las facturas tengan la mejor calidad posible.
+- La solución procesa cada factura en el PDF con procesamiento paralelo para mayor velocidad.

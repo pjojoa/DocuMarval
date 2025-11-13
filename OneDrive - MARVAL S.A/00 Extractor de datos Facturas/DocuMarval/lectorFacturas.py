@@ -41,16 +41,25 @@ def detectar_poppler():
     if poppler_path and os.path.exists(poppler_path):
         return True, poppler_path
     
+    # Detección para Windows
     if platform.system() == 'Windows':
         rutas_comunes = [
             r'C:\Program Files\poppler-25.07.0\Library\bin',
-                r'C:\Program Files\poppler\Library\bin',
-                r'C:\poppler\Library\bin',
-            ]
+            r'C:\Program Files\poppler\Library\bin',
+            r'C:\poppler\Library\bin',
+        ]
         for ruta in rutas_comunes:
-                if os.path.exists(ruta):
-                    return True, ruta
-        
+            if os.path.exists(ruta):
+                return True, ruta
+    
+    # Detección para Linux (Streamlit Cloud, Heroku, etc.)
+    # Poppler generalmente está en /usr/bin o disponible en PATH
+    rutas_linux = ['/usr/bin', '/usr/local/bin']
+    for ruta in rutas_linux:
+        if os.path.exists(os.path.join(ruta, 'pdftoppm')):
+            return True, ruta
+    
+    # Intentar ejecutar pdftoppm directamente (si está en PATH)
     try:
         subprocess.run(['pdftoppm', '-v'], capture_output=True, timeout=2, check=False)
         return True, None
@@ -447,8 +456,14 @@ def procesar_pdf(pdf_bytes, max_workers=4):
     try:
         with st.spinner("Convirtiendo PDF a imágenes..."):
             kwargs = {'dpi': 200}  # DPI reducido para mayor velocidad
-            if POPPLER_PATH and platform.system() == 'Windows':
-                kwargs['poppler_path'] = POPPLER_PATH
+            # Configurar ruta de Poppler si está disponible
+            if POPPLER_PATH:
+                # En Windows, usar poppler_path directamente
+                if platform.system() == 'Windows':
+                    kwargs['poppler_path'] = POPPLER_PATH
+                # En Linux (Streamlit Cloud), Poppler generalmente está en PATH, pero podemos especificar la ruta
+                elif platform.system() == 'Linux' and os.path.exists(os.path.join(POPPLER_PATH, 'pdftoppm')):
+                    kwargs['poppler_path'] = POPPLER_PATH
             imagenes = convert_from_bytes(pdf_bytes, **kwargs)
         
         st.success(f"{len(imagenes)} página(s) convertida(s)")
