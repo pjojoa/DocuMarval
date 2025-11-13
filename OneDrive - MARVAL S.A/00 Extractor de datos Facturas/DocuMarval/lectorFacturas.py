@@ -17,6 +17,8 @@ from collections import deque
 from PIL import Image, ImageEnhance
 import numpy as np
 import base64
+import gc
+import textwrap
 
 load_dotenv()
 
@@ -218,7 +220,7 @@ def validar_imagen_antes_procesar(imagen):
 
 # ==================== CACHÉ DE RESULTADOS ====================
 
-@st.cache_data(ttl=3600)  # Cache por 1 hora
+@st.cache_data(ttl=3600, max_entries=100)  # Cache por 1 hora, máximo 100 entradas para ahorrar memoria
 def extraer_con_gemini_cached(_imagen_hash, imagen_bytes):
     """Extrae datos con caché basado en hash de imagen"""
     try:
@@ -451,11 +453,18 @@ def extraer_datos_factura(imagen):
 
 # ==================== PROCESAMIENTO DE PDF ====================
 
-def procesar_pdf(pdf_bytes, max_workers=4):
-    """Procesa un PDF y extrae datos de facturas con procesamiento paralelo"""
+def procesar_pdf(pdf_bytes, max_workers=4, batch_size=20):
+    """
+    Procesa un PDF y extrae datos de facturas con procesamiento por lotes para optimizar memoria.
+    
+    Args:
+        pdf_bytes: Bytes del PDF
+        max_workers: Número de workers para procesamiento paralelo (no usado actualmente)
+        batch_size: Tamaño del lote para procesar (default: 20 páginas por lote)
+    """
     try:
         with st.spinner("Convirtiendo PDF a imágenes..."):
-            kwargs = {'dpi': 200}  # DPI reducido para mayor velocidad
+            kwargs = {'dpi': 150}  # DPI reducido para ahorrar memoria (de 200 a 150)
             # Configurar ruta de Poppler si está disponible
             if POPPLER_PATH:
                 # En Windows, usar poppler_path directamente
@@ -468,35 +477,50 @@ def procesar_pdf(pdf_bytes, max_workers=4):
         
         st.success(f"{len(imagenes)} página(s) convertida(s)")
         
+        # Liberar memoria del PDF después de convertir
+        del pdf_bytes
+        gc.collect()
+        
     except Exception as e:
         st.error(f"Error al convertir PDF: {str(e)}")
         if not POPPLER_DISPONIBLE:
             st.warning("Poppler no está instalado.")
         return [], {}
     
-    # Validar todas las imágenes antes de procesar
-    imagenes_validas = []
+    # Validar imágenes y crear lista de índices válidos (sin mantener todas las imágenes en memoria)
+    indices_validos = []
     for i, imagen in enumerate(imagenes):
         es_valida, mensaje = validar_imagen_antes_procesar(imagen)
         if not es_valida:
             st.warning(f"Página {i+1} saltada: {mensaje}")
         else:
-            imagenes_validas.append((i, imagen))
+            indices_validos.append(i)
     
-    if not imagenes_validas:
+    if not indices_validos:
         st.error("No hay imágenes válidas para procesar")
         return [], {"gemini": 0, "total": len(imagenes)}
     
-    # Procesar con visualización en tiempo real
+    # Procesar con visualización en tiempo real y gestión de memoria
     resultados_dict = {}
     estadisticas = {"gemini": 0, "total": len(imagenes)}
     
-    # Función auxiliar para convertir imagen a base64
-    def imagen_to_base64(imagen):
-        """Convierte una imagen PIL a base64 para mostrar en HTML"""
+    # Función auxiliar para convertir imagen a base64 (versión optimizada para preview)
+    def imagen_to_base64_preview(imagen, max_size=300):
+        """Convierte una imagen PIL a base64 para preview, reduciendo tamaño para ahorrar memoria"""
+        # Redimensionar imagen para preview (más pequeño = menos memoria)
+        if max(imagen.size) > max_size:
+            ratio = max_size / max(imagen.size)
+            nuevo_tamano = (int(imagen.size[0] * ratio), int(imagen.size[1] * ratio))
+            imagen_preview = imagen.resize(nuevo_tamano, Image.Resampling.LANCZOS)
+        else:
+            imagen_preview = imagen
+        
         buffered = BytesIO()
-        imagen.save(buffered, format="PNG", quality=85)
+        # Usar JPEG en lugar de PNG para ahorrar memoria
+        imagen_preview.save(buffered, format="JPEG", quality=70, optimize=True)
         img_str = base64.b64encode(buffered.getvalue()).decode()
+        buffered.close()
+        del imagen_preview
         return img_str
     
     # Contenedor para mostrar progreso con diseño moderno
@@ -588,149 +612,184 @@ def procesar_pdf(pdf_bytes, max_workers=4):
     
     progress_container = st.container()
     
-    # Procesar cada imagen con visualización en tiempo real
-    for idx, (i, imagen) in enumerate(imagenes_validas):
-        with progress_container:
-            # Placeholder para el card completo
-            card_placeholder = st.empty()
-            
-            # Estado inicial: Procesando
-            img_base64 = imagen_to_base64(imagen)
-            with card_placeholder.container():
-                st.markdown(f"""
-                <div class="processing-card processing" id="card-{i}">
-                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
-                        <div>
-                            <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
-                            <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Análisis con IA en progreso...</p>
-                        </div>
-                        <div class="status-badge status-processing">
-                            <div class="spinner"></div>
-                            <span>Procesando</span>
-                        </div>
-                    </div>
-                    <div style="display: grid; grid-template-columns: 200px 1fr; gap: 1.5rem; align-items: start;">
-                        <div style="border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--glass-border);">
-                            <img src="data:image/png;base64,{img_base64}" style="width: 100%; height: auto; display: block;" alt="Página {i+1}">
-                        </div>
-                        <div>
-                            <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 1rem; margin-bottom: 1rem;">
-                                <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem;">
-                                    <span style="animation: pulse 2s infinite;">⏳</span>
-                                    <span>Extrayendo datos estructurados con Gemini AI...</span>
-                                </p>
-                            </div>
-                            <div style="background: linear-gradient(90deg, var(--brand-300) 0%, var(--brand-300) 0%, rgba(20, 184, 166, 0.1) 0%); border-radius: 8px; height: 6px; margin-bottom: 0.5rem; transition: all 0.3s ease;" id="progress-bar-{i}"></div>
-                            <p style="color: var(--gray-400); margin: 0; font-size: 0.75rem; text-align: right;" id="progress-text-{i}">Iniciando análisis...</p>
-                        </div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Simular progreso mientras procesa
-            progress_individual = st.progress(0)
-            for progress_val in [0.2, 0.4, 0.6, 0.8]:
-                progress_individual.progress(progress_val)
-                time.sleep(0.15)
-            
-            # Procesar la imagen
-            try:
-                datos = extraer_con_gemini(imagen)
-                progress_individual.progress(1.0)
+    # Procesar en lotes para optimizar memoria
+    total_paginas = len(indices_validos)
+    num_batches = (total_paginas + batch_size - 1) // batch_size
+    
+    st.info(f"💾 Procesando {total_paginas} páginas en {num_batches} lote(s) de {batch_size} para optimizar memoria")
+    
+    # Procesar cada lote
+    for batch_num in range(num_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, total_paginas)
+        batch_indices = indices_validos[start_idx:end_idx]
+        
+        st.markdown(f"---\n**📦 Lote {batch_num + 1}/{num_batches}** - Páginas {start_idx + 1} a {end_idx}")
+        
+        # Procesar cada imagen del lote
+        for idx, i in enumerate(batch_indices):
+            with progress_container:
+                # Placeholder para el card completo
+                card_placeholder = st.empty()
                 
-                if datos:
-                    datos["pagina"] = i + 1
-                    datos["metodo_extraccion"] = "Gemini"
-                    resultados_dict[i] = datos
-                    estadisticas["gemini"] += 1
-                    
-                    # Actualizar card con datos extraídos
-                    with card_placeholder.container():
-                        st.markdown(f"""
-                        <div class="processing-card completed" id="card-{i}">
+                # Obtener imagen solo cuando se necesita (no mantener todas en memoria)
+                imagen = imagenes[i]
+                
+                # Estado inicial: Procesando (usar preview pequeño)
+                img_base64 = imagen_to_base64_preview(imagen, max_size=250)
+                
+                with card_placeholder.container():
+                    card_html_inicial = textwrap.dedent(f"""
+                        <div class="processing-card processing" id="card-{i}">
                             <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
                                 <div>
                                     <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
-                                    <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Datos extraídos exitosamente</p>
+                                    <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Análisis con IA en progreso...</p>
                                 </div>
-                                <div class="status-badge status-completed">
-                                    <span style="color: var(--brand-400);">✓</span>
-                                    <span>Completado</span>
+                                <div class="status-badge status-processing">
+                                    <div class="spinner"></div>
+                                    <span>Procesando</span>
                                 </div>
                             </div>
                             <div style="display: grid; grid-template-columns: 200px 1fr; gap: 1.5rem; align-items: start;">
                                 <div style="border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--glass-border);">
-                                    <img src="data:image/png;base64,{img_base64}" style="width: 100%; height: auto; display: block;" alt="Página {i+1}">
+                                    <img src="data:image/jpeg;base64,{img_base64}" style="width: 100%; height: auto; display: block;" alt="Página {i+1}">
                                 </div>
                                 <div>
-                                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
-                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
-                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Contrato</strong></p>
-                                            <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">{datos.get("numero_contrato") or "N/A"}</p>
-                                        </div>
-                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
-                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Total</strong></p>
-                                            <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">${datos.get('total_pagar', 0):,.0f}</p>
-                                        </div>
-                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
-                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Referencia</strong></p>
-                                            <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("codigo_referencia") or "N/A")[:20]}</p>
-                                        </div>
-                                        <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
-                                            <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Empresa</strong></p>
-                                            <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("empresa") or "N/A")[:25]}</p>
-                                        </div>
+                                    <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 1rem; margin-bottom: 1rem;">
+                                        <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem;">
+                                            <span style="animation: pulse 2s infinite;">⏳</span>
+                                            <span>Extrayendo datos estructurados con Gemini AI...</span>
+                                        </p>
                                     </div>
-                                    <div style="background: rgba(20, 184, 166, 0.1); border: 1px solid rgba(20, 184, 166, 0.3); border-radius: var(--radius-sm); padding: 0.75rem; text-align: center;">
-                                        <p style="color: var(--brand-400); margin: 0; font-size: 0.875rem; font-weight: 600;">✓ Datos extraídos exitosamente</p>
-                                    </div>
+                                    <div style="background: linear-gradient(90deg, var(--brand-300) 0%, var(--brand-300) 0%, rgba(20, 184, 166, 0.1) 0%); border-radius: 8px; height: 6px; margin-bottom: 0.5rem; transition: all 0.3s ease;" id="progress-bar-{i}"></div>
+                                    <p style="color: var(--gray-400); margin: 0; font-size: 0.75rem; text-align: right;" id="progress-text-{i}">Iniciando análisis...</p>
                                 </div>
                             </div>
                         </div>
-                        """, unsafe_allow_html=True)
+                    """)
+                    st.markdown(card_html_inicial, unsafe_allow_html=True)
+                
+                # Simular progreso mientras procesa
+                progress_individual = st.progress(0)
+                for progress_val in [0.2, 0.4, 0.6, 0.8]:
+                    progress_individual.progress(progress_val)
+                    time.sleep(0.15)
+                
+                # Procesar la imagen
+                try:
+                    datos = extraer_con_gemini(imagen)
+                    progress_individual.progress(1.0)
                     
-                else:
-                    # Error en extracción
+                    if datos:
+                        datos["pagina"] = i + 1
+                        datos["metodo_extraccion"] = "Gemini"
+                        resultados_dict[i] = datos
+                        estadisticas["gemini"] += 1
+                        
+                        # Actualizar card con datos extraídos
+                        with card_placeholder.container():
+                            card_html_completado = textwrap.dedent(f"""
+                                <div class="processing-card completed" id="card-{i}">
+                                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                                        <div>
+                                            <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                                            <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Datos extraídos exitosamente</p>
+                                        </div>
+                                        <div class="status-badge status-completed">
+                                            <span style="color: var(--brand-400);">✓</span>
+                                            <span>Completado</span>
+                                        </div>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: 200px 1fr; gap: 1.5rem; align-items: start;">
+                                        <div style="border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--glass-border);">
+                                            <img src="data:image/jpeg;base64,{img_base64}" style="width: 100%; height: auto; display: block;" alt="Página {i+1}">
+                                        </div>
+                                        <div>
+                                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+                                                <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                                    <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Contrato</strong></p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">{datos.get("numero_contrato") or "N/A"}</p>
+                                                </div>
+                                                <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                                    <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Total</strong></p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 1rem; font-weight: 700;">${datos.get('total_pagar', 0):,.0f}</p>
+                                                </div>
+                                                <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                                    <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Referencia</strong></p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("codigo_referencia") or "N/A")[:20]}</p>
+                                                </div>
+                                                <div style="background: rgba(20, 184, 166, 0.05); border: 1px solid rgba(20, 184, 166, 0.2); border-radius: var(--radius-sm); padding: 0.875rem;">
+                                                    <p style="color: var(--gray-300); margin: 0 0 0.5rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;"><strong style="color: var(--white);">Empresa</strong></p>
+                                                    <p style="color: var(--brand-300); margin: 0; font-size: 0.875rem; font-weight: 600;">{(datos.get("empresa") or "N/A")[:25]}</p>
+                                                </div>
+                                            </div>
+                                            <div style="background: rgba(20, 184, 166, 0.1); border: 1px solid rgba(20, 184, 166, 0.3); border-radius: var(--radius-sm); padding: 0.75rem; text-align: center;">
+                                                <p style="color: var(--brand-400); margin: 0; font-size: 0.875rem; font-weight: 600;">✓ Datos extraídos exitosamente</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            """)
+                            st.markdown(card_html_completado, unsafe_allow_html=True)
+                        
+                    else:
+                        # Error en extracción
+                        with card_placeholder.container():
+                            card_html_error_extraccion = textwrap.dedent(f"""
+                                <div class="processing-card error" id="card-{i}">
+                                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                                        <div>
+                                            <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                                            <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Error en la extracción</p>
+                                        </div>
+                                        <div class="status-badge status-error">
+                                            <span>✗</span>
+                                            <span>Error</span>
+                                        </div>
+                                    </div>
+                                    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 1rem;">
+                                        <p style="color: #EF4444; margin: 0; font-size: 0.875rem;">⚠️ No se pudieron extraer datos de esta página</p>
+                                    </div>
+                                </div>
+                            """)
+                            st.markdown(card_html_error_extraccion, unsafe_allow_html=True)
+                    
+                except Exception as e:
+                    # Error en procesamiento
+                    progress_individual.progress(1.0)
                     with card_placeholder.container():
-                        st.markdown(f"""
-                        <div class="processing-card error" id="card-{i}">
-                            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
-                                <div>
-                                    <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
-                                    <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Error en la extracción</p>
+                        card_html_error_procesamiento = textwrap.dedent(f"""
+                            <div class="processing-card error" id="card-{i}">
+                                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
+                                    <div>
+                                        <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
+                                        <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Error en el procesamiento</p>
+                                    </div>
+                                    <div class="status-badge status-error">
+                                        <span>✗</span>
+                                        <span>Error</span>
+                                    </div>
                                 </div>
-                                <div class="status-badge status-error">
-                                    <span>✗</span>
-                                    <span>Error</span>
+                                <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 1rem;">
+                                    <p style="color: #EF4444; margin: 0; font-size: 0.875rem;">❌ Error: {str(e)[:100]}</p>
                                 </div>
                             </div>
-                            <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 1rem;">
-                                <p style="color: #EF4444; margin: 0; font-size: 0.875rem;">⚠️ No se pudieron extraer datos de esta página</p>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-            except Exception as e:
-                # Error en procesamiento
-                progress_individual.progress(1.0)
-                with card_placeholder.container():
-                    st.markdown(f"""
-                    <div class="processing-card error" id="card-{i}">
-                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem;">
-                            <div>
-                                <h4 style="color: var(--brand-300); margin: 0 0 0.25rem 0; font-size: 1.1rem; font-weight: 700;">📄 Página {i+1} de {len(imagenes)}</h4>
-                                <p style="color: var(--gray-300); margin: 0; font-size: 0.875rem;">Error en el procesamiento</p>
-                            </div>
-                            <div class="status-badge status-error">
-                                <span>✗</span>
-                                <span>Error</span>
-                            </div>
-                        </div>
-                        <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 1rem;">
-                            <p style="color: #EF4444; margin: 0; font-size: 0.875rem;">❌ Error: {str(e)[:100]}</p>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        """)
+                        st.markdown(card_html_error_procesamiento, unsafe_allow_html=True)
+                
+                # Liberar memoria después de procesar cada imagen
+                del imagen
+                del img_base64
+                progress_individual.empty()
+                
+                # Forzar recolección de basura cada 10 páginas
+                if (idx + 1) % 10 == 0:
+                    gc.collect()
+        
+        # Limpiar memoria después de cada lote
+        gc.collect()
+        st.success(f"✅ Lote {batch_num + 1}/{num_batches} completado - Memoria liberada")
     
     # Ordenar resultados por índice de página
     resultados = [resultados_dict[i] for i in sorted(resultados_dict.keys())]
@@ -769,11 +828,23 @@ def procesar_pdf(pdf_bytes, max_workers=4):
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Expander para ver detalles completos
+                # Expander para ver detalles completos (cargar imagen solo cuando se expande)
                 with st.expander(f"🔍 Ver detalles completos - Página {pagina}", expanded=False):
                     col1, col2 = st.columns([1, 2])
                     with col1:
-                        st.image(imagenes[pagina - 1], caption=f"Página {pagina}", use_container_width=True)
+                        # Cargar imagen solo cuando se necesita (no mantener todas en memoria)
+                        try:
+                            imagen_detalle = imagenes[pagina - 1]
+                            # Reducir tamaño para ahorrar memoria
+                            if max(imagen_detalle.size) > 800:
+                                ratio = 800 / max(imagen_detalle.size)
+                                nuevo_tamano = (int(imagen_detalle.size[0] * ratio), 
+                                               int(imagen_detalle.size[1] * ratio))
+                                imagen_detalle = imagen_detalle.resize(nuevo_tamano, Image.Resampling.LANCZOS)
+                            st.image(imagen_detalle, caption=f"Página {pagina}", use_container_width=True)
+                            del imagen_detalle
+                        except Exception as e:
+                            st.warning(f"No se pudo cargar la imagen: {str(e)}")
                     with col2:
                         st.json(resultado)
     
@@ -1493,7 +1564,11 @@ GEMINI_MODEL=gemini-2.5-flash
                 return
             
             pdf_bytes = uploaded_file.read()
-            facturas, stats = procesar_pdf(pdf_bytes)
+            # Ajustar batch_size según el tamaño del PDF para optimizar memoria
+            # PDFs grandes: lotes más pequeños, PDFs pequeños: lotes más grandes
+            # Para 200 páginas, usar batch_size=15 para mejor gestión de memoria
+            batch_size = 15 if len(pdf_bytes) > 5_000_000 else 20  # Aprox 5MB
+            facturas, stats = procesar_pdf(pdf_bytes, batch_size=batch_size)
             
             if facturas:
                 st.divider()
