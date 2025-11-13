@@ -41,3 +41,6 @@ Thumbs.db
 poppler-*/
 poppler.zip
 *.zip
+
+# System packages (for Streamlit Cloud, use requirements.txt only)
+packages.txt
