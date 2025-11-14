@@ -28,37 +28,155 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Importar CSS del archivo original
+# Importar CSS personalizado
 def load_custom_css():
-    """Carga el CSS personalizado desde lectorFacturas.py"""
+    """Carga el CSS personalizado completo"""
     try:
-        import lectorFacturas
-        lectorFacturas.load_custom_css()
+        from ui.styles import load_custom_css as load_ui_css
+        load_ui_css()
     except Exception as e:
-        logger.warning(f"No se pudo cargar CSS personalizado: {e}")
-        # CSS básico de fallback
-        st.markdown("""
-        <style>
-        :root {
-            --brand-900: #0B1220;
-            --brand-800: #0F172A;
-            --brand-700: #13223A;
-            --brand-600: #173B5F;
-            --brand-500: #1E5AA5;
-            --brand-400: #2F7DEB;
-            --brand-300: #72A8FF;
-            --white: #FFFFFF;
-            --gray-300: #CBD5E1;
-            --glass-bg: rgba(255, 255, 255, 0.1);
-            --glass-border: rgba(207, 225, 255, 0.3);
-            --radius-md: 14px;
-        }
-        .stApp {
-            background: linear-gradient(135deg, var(--brand-900) 0%, var(--brand-800) 50%, var(--brand-700) 100%);
-            color: var(--white);
-        }
-        </style>
-        """, unsafe_allow_html=True)
+        logger.warning(f"No se pudo cargar CSS desde ui.styles: {e}")
+        # Intentar desde lectorFacturas como fallback
+        try:
+            import lectorFacturas
+            lectorFacturas.load_custom_css()
+        except Exception as e2:
+            logger.warning(f"No se pudo cargar CSS desde lectorFacturas: {e2}")
+            # CSS completo de fallback con todas las clases necesarias
+            css_completo = """
+            <style>
+            :root {
+                --brand-900: #0B1220;
+                --brand-800: #0F172A;
+                --brand-700: #13223A;
+                --brand-600: #173B5F;
+                --brand-500: #1E5AA5;
+                --brand-400: #2F7DEB;
+                --brand-300: #72A8FF;
+                --brand-200: #CFE1FF;
+                --brand-100: #EAF1FF;
+                --gray-900: #0F172A;
+                --gray-700: #334155;
+                --gray-500: #64748B;
+                --gray-300: #CBD5E1;
+                --gray-100: #F1F5F9;
+                --white: #FFFFFF;
+                --radius-md: 14px;
+                --radius-lg: 16px;
+                --elevation-1: 0 8px 24px rgba(0, 0, 0, 0.12);
+                --elevation-2: 0 16px 36px rgba(0, 0, 0, 0.16);
+                --glass-bg: rgba(255, 255, 255, 0.1);
+                --glass-border: rgba(207, 225, 255, 0.3);
+            }
+            .stApp {
+                background: linear-gradient(135deg, var(--brand-900) 0%, var(--brand-800) 50%, var(--brand-700) 100%);
+                background-attachment: fixed;
+                color: var(--white);
+                min-height: 100vh;
+            }
+            .main-header {
+                background: linear-gradient(135deg, rgba(20, 184, 166, 0.15) 0%, rgba(0, 209, 255, 0.1) 100%);
+                backdrop-filter: blur(20px);
+                border: 2px solid rgba(20, 184, 166, 0.3);
+                border-radius: 24px;
+                padding: 4rem 3rem;
+                margin: 2rem auto;
+                max-width: 1400px;
+                box-shadow: 0 8px 32px rgba(20, 184, 166, 0.2);
+            }
+            .header-content {
+                display: flex;
+                flex-direction: column;
+                gap: 1.25rem;
+                align-items: center;
+                text-align: center;
+            }
+            .header-title-container {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 2rem;
+                flex-wrap: wrap;
+                width: 100%;
+            }
+            .header-logo {
+                height: 238px;
+                width: auto;
+                flex-shrink: 0;
+                display: flex;
+                align-items: center;
+            }
+            .header-logo img {
+                height: 238px;
+                width: auto;
+                object-fit: contain;
+                display: block;
+            }
+            .main-header h1 {
+                color: var(--white);
+                font-weight: 800;
+                font-size: 3.5rem;
+                margin: 0;
+                line-height: 1.1;
+            }
+            .main-header .subtitle {
+                color: var(--gray-300);
+                font-size: 1.35rem;
+                margin: 0;
+                font-weight: 400;
+            }
+            .status-card {
+                background: var(--glass-bg);
+                backdrop-filter: blur(10px);
+                border: 1px solid var(--glass-border);
+                border-radius: var(--radius-md);
+                padding: 1.5rem;
+                margin: 0.5rem 0;
+                box-shadow: var(--elevation-1);
+            }
+            .status-card.success {
+                border-left: 4px solid var(--brand-400);
+            }
+            .status-card.error {
+                border-left: 4px solid #EF4444;
+            }
+            .info-box {
+                background: var(--glass-bg);
+                backdrop-filter: blur(10px);
+                border: 1px solid var(--glass-border);
+                border-left: 4px solid var(--brand-400);
+                border-radius: var(--radius-md);
+                padding: 1.5rem;
+                margin: 2rem 0;
+            }
+            .metric-card {
+                background: var(--glass-bg);
+                backdrop-filter: blur(10px);
+                border: 1px solid var(--glass-border);
+                border-radius: var(--radius-md);
+                padding: 1.5rem;
+                text-align: center;
+            }
+            .metric-value {
+                font-size: 2rem;
+                font-weight: 700;
+                color: var(--brand-300);
+                margin: 0.5rem 0;
+            }
+            .metric-label {
+                color: var(--gray-300);
+                font-size: 0.875rem;
+                text-transform: uppercase;
+            }
+            h1, h2, h3 {
+                color: var(--white);
+            }
+            h3 {
+                color: var(--brand-300);
+            }
+            </style>
+            """
+            st.markdown(css_completo, unsafe_allow_html=True)
 
 def load_logo(height="80px"):
     """Carga el logo de DocuMarval"""
